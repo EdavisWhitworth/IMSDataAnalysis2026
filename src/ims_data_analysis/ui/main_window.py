@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import sys
 from pathlib import Path
 
@@ -7,14 +8,18 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.exporters import SVGExporter
 from PyQt5 import QtCore
+from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
     QFileDialog,
     QFormLayout,
+    QFontComboBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -25,6 +30,7 @@ from PyQt5.QtWidgets import (
     QWidget,
     QComboBox,
     QDoubleSpinBox,
+    QSpinBox,
 )
 
 from ims_data_analysis.analysis.metrics import detect_all_peaks, detect_nearest_peak
@@ -41,6 +47,17 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("IMS Data Analysis 2026")
         self.resize(1550, 980)
 
+        self.spectrum_curve_color = "#000000"
+        self.baseline_color = "#4cacf7"
+        self.peak_color = "#e67700"
+        self.cursor_color = "#ff6b6b"
+        self.spectrum_background_color = "#ffffff"
+        self.spectrum_text_color = "#000000"
+        self.spectrum_font_family = "Arial"
+        self.spectrum_font_size = 11
+        self.spectrum_title_text = "Selected Spectrum"
+        self.spectrum_show_title = True
+
         self.loaded: LoadedExperiment | None = None
         self.mode_view: ModeView | None = None
         self.current_row: int = 0
@@ -54,8 +71,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         layout = QHBoxLayout(root)
 
-        control_panel = QWidget()
-        control_layout = QVBoxLayout(control_panel)
+        left_control_panel = QWidget()
+        control_layout = QVBoxLayout(left_control_panel)
 
         file_group = QGroupBox("Data")
         file_form = QFormLayout(file_group)
@@ -129,18 +146,72 @@ class MainWindow(QMainWindow):
         export_group = QGroupBox("Export")
         export_layout = QVBoxLayout(export_group)
         self.export_spectrum_btn = QPushButton("Export Current Spectrum SVG")
+        self.export_spectrum_csv_btn = QPushButton("Export Current Spectrum CSV")
+        self.export_table_csv_btn = QPushButton("Export Peak Table CSV")
         self.export_heatmap_btn = QPushButton("Export Current Heatmap SVG")
+        for _btn in (
+            self.export_spectrum_btn,
+            self.export_spectrum_csv_btn,
+            self.export_table_csv_btn,
+            self.export_heatmap_btn,
+        ):
+            _btn.setMinimumHeight(56)
         self.export_spectrum_btn.clicked.connect(self._export_spectrum_svg)
+        self.export_spectrum_csv_btn.clicked.connect(self._export_spectrum_csv)
+        self.export_table_csv_btn.clicked.connect(self._export_table_csv)
         self.export_heatmap_btn.clicked.connect(self._export_heatmap_svg)
         export_layout.addWidget(self.export_spectrum_btn)
+        export_layout.addWidget(self.export_spectrum_csv_btn)
+        export_layout.addWidget(self.export_table_csv_btn)
         export_layout.addWidget(self.export_heatmap_btn)
-        control_layout.addWidget(export_group)
+
+        style_group = QGroupBox("Spectrum Style")
+        style_form = QFormLayout(style_group)
+        self.curve_color_btn = QPushButton()
+        self.curve_color_btn.clicked.connect(lambda: self._pick_color("spectrum_curve_color", self.curve_color_btn))
+        self.baseline_color_btn = QPushButton()
+        self.baseline_color_btn.clicked.connect(lambda: self._pick_color("baseline_color", self.baseline_color_btn))
+        self.peak_color_btn = QPushButton()
+        self.peak_color_btn.clicked.connect(lambda: self._pick_color("peak_color", self.peak_color_btn))
+        self.cursor_color_btn = QPushButton()
+        self.cursor_color_btn.clicked.connect(lambda: self._pick_color("cursor_color", self.cursor_color_btn))
+        self.bg_color_btn = QPushButton()
+        self.bg_color_btn.clicked.connect(
+            lambda: self._pick_color("spectrum_background_color", self.bg_color_btn)
+        )
+        self.text_color_btn = QPushButton()
+        self.text_color_btn.clicked.connect(lambda: self._pick_color("spectrum_text_color", self.text_color_btn))
+        self.font_family_combo = QFontComboBox()
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(7, 30)
+        self.font_size_spin.setValue(self.spectrum_font_size)
+        self.title_edit = QLineEdit(self.spectrum_title_text)
+        self.show_title_checkbox = QCheckBox("Display spectrum title")
+        self.show_title_checkbox.setChecked(self.spectrum_show_title)
+        self.export_peak_highlights_checkbox = QCheckBox("Include detected peak highlights in spectrum SVG")
+        self.export_peak_highlights_checkbox.setChecked(True)
+        self.font_family_combo.currentFontChanged.connect(self._on_spectrum_font_changed)
+        self.font_size_spin.valueChanged.connect(self._on_spectrum_font_changed)
+        self.title_edit.textChanged.connect(self._on_spectrum_title_changed)
+        self.show_title_checkbox.toggled.connect(self._on_spectrum_title_changed)
+
+        style_form.addRow("Trace Color:", self.curve_color_btn)
+        style_form.addRow("Baseline Color:", self.baseline_color_btn)
+        style_form.addRow("Peak Marker Color:", self.peak_color_btn)
+        style_form.addRow("Cursor Color:", self.cursor_color_btn)
+        style_form.addRow("Background Color:", self.bg_color_btn)
+        style_form.addRow("Text/Axis Color:", self.text_color_btn)
+        style_form.addRow("Font Family:", self.font_family_combo)
+        style_form.addRow("Font Size:", self.font_size_spin)
+        style_form.addRow("Title Text:", self.title_edit)
+        style_form.addRow(self.show_title_checkbox)
+        style_form.addRow(self.export_peak_highlights_checkbox)
 
         control_layout.addStretch(1)
-        control_panel.setMinimumWidth(340)
-        layout.addWidget(control_panel)
+        left_control_panel.setMinimumWidth(340)
 
         splitter = QSplitter(QtCore.Qt.Vertical)
+        self._main_splitter = splitter
 
         self.heatmap_panel = QWidget()
         heatmap_layout = QHBoxLayout(self.heatmap_panel)
@@ -168,22 +239,22 @@ class MainWindow(QMainWindow):
         self.spectrum_plot = pg.PlotWidget(title="Selected Spectrum")
         self.spectrum_plot.setLabel("bottom", "X")
         self.spectrum_plot.setLabel("left", "Signal")
-        self.spectrum_curve = self.spectrum_plot.plot([], [], pen=pg.mkPen(color="#2b8a3e", width=2))
+        self.spectrum_curve = self.spectrum_plot.plot([], [], pen=pg.mkPen(color=self.spectrum_curve_color, width=2))
         self.noise_markers = pg.ScatterPlotItem(
             size=4,
             symbol="o",
-            pen=pg.mkPen(color="#1c7ed6", width=1),
-            brush=pg.mkBrush(76, 171, 247, 170),
+            pen=pg.mkPen(color=self.baseline_color, width=1),
+            brush=pg.mkBrush(self._color_with_alpha(self.baseline_color, 170)),
         )
         self.spectrum_plot.addItem(self.noise_markers)
         self.peak_markers = pg.ScatterPlotItem(
             size=11,
             symbol="o",
-            pen=pg.mkPen(color="#e67700", width=2),
+            pen=pg.mkPen(color=self.peak_color, width=2),
             brush=pg.mkBrush(255, 236, 153, 200),
         )
         self.spectrum_plot.addItem(self.peak_markers)
-        self.cursor_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ff6b6b", width=1.5))
+        self.cursor_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(self.cursor_color, width=1.5))
         self.spectrum_plot.addItem(self.cursor_line)
         self.spectrum_plot.scene().sigMouseClicked.connect(self._on_spectrum_click)
 
@@ -208,7 +279,41 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(2, 2)
         splitter.setStretchFactor(3, 3)
 
+        # Right panel uses a hidden-handle splitter that stays in sync with the main splitter.
+        # pane 0 → heatmap row  (holds Export group)
+        # pane 1 → spectrum row (holds Spectrum Style group)
+        # pane 2 → table/optimised row (empty spacer)
+        self._right_splitter = QSplitter(QtCore.Qt.Vertical)
+        self._right_splitter.setHandleWidth(0)
+        self._right_splitter.setChildrenCollapsible(False)
+
+        _export_container = QWidget()
+        _ec_layout = QVBoxLayout(_export_container)
+        _ec_layout.setContentsMargins(0, 0, 0, 0)
+        _ec_layout.addWidget(export_group)
+        _ec_layout.addStretch(1)
+
+        _style_container = QWidget()
+        _sc_layout = QVBoxLayout(_style_container)
+        _sc_layout.setContentsMargins(0, 0, 0, 0)
+        _sc_layout.addWidget(style_group)
+        _sc_layout.addStretch(1)
+
+        _bottom_spacer = QWidget()
+
+        self._right_splitter.addWidget(_export_container)
+        self._right_splitter.addWidget(_style_container)
+        self._right_splitter.addWidget(_bottom_spacer)
+
+        right_control_panel = QWidget()
+        right_control_layout = QVBoxLayout(right_control_panel)
+        right_control_layout.setContentsMargins(0, 0, 0, 0)
+        right_control_layout.addWidget(self._right_splitter)
+        right_control_panel.setMinimumWidth(360)
+
+        layout.addWidget(left_control_panel)
         layout.addWidget(splitter, stretch=1)
+        layout.addWidget(right_control_panel)
 
         for widget in [
             self.pressure_spin,
@@ -230,6 +335,22 @@ class MainWindow(QMainWindow):
         self.voltage_override_missing_only_checkbox.toggled.connect(self._on_override_controls_changed)
 
         self._apply_loaded_settings_to_controls()
+        self.font_family_combo.setCurrentFont(QFont(self.spectrum_font_family))
+        self._sync_color_button_labels()
+        self._apply_spectrum_style()
+        splitter.splitterMoved.connect(self._sync_right_splitter)
+        # initialise right splitter after event loop starts so sizes are available
+        QtCore.QTimer.singleShot(0, lambda: self._sync_right_splitter())
+
+    def _sync_right_splitter(self, *_args) -> None:
+        """Keep the right-panel splitter aligned with the main content splitter."""
+        sizes = self._main_splitter.sizes()
+        if not sizes or sum(sizes) == 0:
+            return
+        heatmap_sz = sizes[0]
+        spectrum_sz = sizes[1]
+        rest_sz = sum(sizes[2:])
+        self._right_splitter.setSizes([heatmap_sz, spectrum_sz, rest_sz])
 
     def _spin(self, minimum: float, maximum: float, value: float, step: float) -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
@@ -238,6 +359,70 @@ class MainWindow(QMainWindow):
         spin.setSingleStep(step)
         spin.setDecimals(5)
         return spin
+
+    def _color_with_alpha(self, color_hex: str, alpha: int) -> QColor:
+        color = QColor(color_hex)
+        color.setAlpha(int(np.clip(alpha, 0, 255)))
+        return color
+
+    def _pick_color(self, attr_name: str, button: QPushButton) -> None:
+        current = QColor(getattr(self, attr_name))
+        chosen = QColorDialog.getColor(current, self, "Select Color")
+        if not chosen.isValid():
+            return
+        setattr(self, attr_name, chosen.name())
+        button.setText(chosen.name())
+        self._apply_spectrum_style()
+
+    def _on_spectrum_font_changed(self, *_args) -> None:
+        self.spectrum_font_family = self.font_family_combo.currentFont().family()
+        self.spectrum_font_size = int(self.font_size_spin.value())
+        self._apply_spectrum_style()
+
+    def _on_spectrum_title_changed(self, *_args) -> None:
+        self.spectrum_title_text = self.title_edit.text().strip()
+        self.spectrum_show_title = self.show_title_checkbox.isChecked()
+        self._apply_spectrum_style()
+
+    def _sync_color_button_labels(self) -> None:
+        self.curve_color_btn.setText(self.spectrum_curve_color)
+        self.baseline_color_btn.setText(self.baseline_color)
+        self.peak_color_btn.setText(self.peak_color)
+        self.cursor_color_btn.setText(self.cursor_color)
+        self.bg_color_btn.setText(self.spectrum_background_color)
+        self.text_color_btn.setText(self.spectrum_text_color)
+
+    def _apply_spectrum_style(self) -> None:
+        self.spectrum_curve.setPen(pg.mkPen(color=self.spectrum_curve_color, width=2))
+        self.noise_markers.setPen(pg.mkPen(color=self.baseline_color, width=1))
+        self.noise_markers.setBrush(pg.mkBrush(self._color_with_alpha(self.baseline_color, 170)))
+        self.peak_markers.setPen(pg.mkPen(color=self.peak_color, width=2))
+        self.cursor_line.setPen(pg.mkPen(self.cursor_color, width=1.5))
+        self.spectrum_plot.setBackground(self.spectrum_background_color)
+
+        font = QFont(self.spectrum_font_family, self.spectrum_font_size)
+        css_size = f"{self.spectrum_font_size}pt"
+        text_style = {"color": self.spectrum_text_color, "font-size": css_size}
+        self.spectrum_plot.setLabel("bottom", self.mode_view.x_label if self.mode_view else "X", **text_style)
+        self.spectrum_plot.setLabel("left", "Signal", **text_style)
+        if self.spectrum_show_title:
+            title_text = self.spectrum_title_text or "Selected Spectrum"
+            self.spectrum_plot.setTitle(
+                (
+                    f"<span style='color:{self.spectrum_text_color};"
+                    f" font-family:{self.spectrum_font_family}; font-size:{css_size};'>"
+                    f"{title_text}"
+                    "</span>"
+                )
+            )
+        else:
+            self.spectrum_plot.setTitle("")
+        self.spectrum_plot.getAxis("bottom").setPen(pg.mkPen(self.spectrum_text_color))
+        self.spectrum_plot.getAxis("left").setPen(pg.mkPen(self.spectrum_text_color))
+        self.spectrum_plot.getAxis("bottom").setTextPen(pg.mkPen(self.spectrum_text_color))
+        self.spectrum_plot.getAxis("left").setTextPen(pg.mkPen(self.spectrum_text_color))
+        self.spectrum_plot.getAxis("bottom").setStyle(tickFont=font)
+        self.spectrum_plot.getAxis("left").setStyle(tickFont=font)
 
     def _apply_loaded_settings_to_controls(self) -> None:
         self.mode_override_checkbox.setChecked(self.user_settings.mode_override_enabled)
@@ -404,6 +589,7 @@ class MainWindow(QMainWindow):
 
         self.spectrum_curve.setData(x, y)
         self.spectrum_plot.setLabel("bottom", self.mode_view.x_label)
+        self._apply_spectrum_style()
 
         if x.size:
             if self.cursor_x < float(np.min(x)) or self.cursor_x > float(np.max(x)):
@@ -547,7 +733,7 @@ class MainWindow(QMainWindow):
         self.optimized_curve.setData(voltage_axis, optimized_trace)
         self.optimized_plot.show()
 
-    def _export_plot_svg(self, plot_widget: pg.PlotWidget, caption: str) -> None:
+    def _export_plot_svg(self, plot_widget: pg.PlotWidget, caption: str, hide_cursor: bool = False) -> None:
         out_path, _ = QFileDialog.getSaveFileName(self, caption, str(Path.home() / "figure.svg"), "SVG Files (*.svg)")
         if not out_path:
             return
@@ -557,15 +743,82 @@ class MainWindow(QMainWindow):
             path = path.with_suffix(".svg")
 
         cursor_visible = self.cursor_line.isVisible()
-        self.cursor_line.setVisible(False)
+        if hide_cursor:
+            self.cursor_line.setVisible(False)
         try:
             exporter = SVGExporter(plot_widget.plotItem)
             exporter.export(str(path))
         finally:
-            self.cursor_line.setVisible(cursor_visible)
+            if hide_cursor:
+                self.cursor_line.setVisible(cursor_visible)
 
     def _export_spectrum_svg(self) -> None:
-        self._export_plot_svg(self.spectrum_plot, "Export Spectrum SVG")
+        baseline_visible = self.noise_markers.isVisible()
+        peaks_visible = self.peak_markers.isVisible()
+        self.noise_markers.setVisible(False)
+        self.peak_markers.setVisible(peaks_visible and self.export_peak_highlights_checkbox.isChecked())
+        try:
+            self._export_plot_svg(self.spectrum_plot, "Export Spectrum SVG", hide_cursor=True)
+        finally:
+            self.noise_markers.setVisible(baseline_visible)
+            self.peak_markers.setVisible(peaks_visible)
+
+    def _export_spectrum_csv(self) -> None:
+        if self.mode_view is None or self.mode_view.heatmap.size == 0:
+            QMessageBox.warning(self, "Export Error", "No spectrum is currently available for CSV export.")
+            return
+
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Spectrum CSV",
+            str(Path.home() / "spectrum.csv"),
+            "CSV Files (*.csv)",
+        )
+        if not out_path:
+            return
+
+        path = Path(out_path)
+        if path.suffix.lower() != ".csv":
+            path = path.with_suffix(".csv")
+
+        x = np.asarray(self.mode_view.x_axis, dtype=np.float64)
+        y = np.asarray(self.mode_view.heatmap[self.current_row, :], dtype=np.float64)
+        data = np.column_stack((x, y))
+        x_label = self.mode_view.x_label.replace(",", " ")
+        np.savetxt(path, data, delimiter=",", header=f"{x_label},Signal", comments="")
+
+    def _export_table_csv(self) -> None:
+        if self.peak_table.rowCount() == 0:
+            QMessageBox.warning(self, "Export Error", "Peak table is empty. Run peak detection first.")
+            return
+
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Peak Table CSV",
+            str(Path.home() / "peak_table.csv"),
+            "CSV Files (*.csv)",
+        )
+        if not out_path:
+            return
+
+        path = Path(out_path)
+        if path.suffix.lower() != ".csv":
+            path = path.with_suffix(".csv")
+
+        headers: list[str] = []
+        for col in range(self.peak_table.columnCount()):
+            header_item = self.peak_table.horizontalHeaderItem(col)
+            headers.append(header_item.text() if header_item is not None else f"Column {col + 1}")
+
+        with path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(headers)
+            for row in range(self.peak_table.rowCount()):
+                row_values: list[str] = []
+                for col in range(self.peak_table.columnCount()):
+                    item = self.peak_table.item(row, col)
+                    row_values.append(item.text() if item is not None else "")
+                writer.writerow(row_values)
 
     def _export_heatmap_svg(self) -> None:
         self._export_plot_svg(self.heat_plot, "Export Heatmap SVG")
