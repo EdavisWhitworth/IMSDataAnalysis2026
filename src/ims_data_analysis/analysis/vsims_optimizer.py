@@ -42,8 +42,27 @@ def extract_optimized_trace(
     topt_values = np.clip(topt_values, float(np.min(x_time_ms)), float(np.max(x_time_ms)))
 
     trace = []
+    max_time_ms = max(1e-9, float(np.max(x_time_ms)))
     for row_index, t_opt in enumerate(topt_values):
-        col_idx = int(np.argmin(np.abs(x_time_ms - t_opt)))
-        trace.append(float(heatmap[row_index, col_idx]))
+        row = np.asarray(heatmap[row_index, :], dtype=np.float64)
+        point_count = int(row.shape[0])
+        if point_count <= 0:
+            trace.append(0.0)
+            continue
+        if point_count == 1:
+            trace.append(float(row[0]))
+            continue
+
+        idx_float = (float(t_opt) / max_time_ms) * float(point_count - 1)
+        idx_low = int(np.floor(idx_float))
+        idx_high = int(np.ceil(idx_float))
+        idx_low = int(np.clip(idx_low, 0, point_count - 1))
+        idx_high = int(np.clip(idx_high, 0, point_count - 1))
+        if idx_low == idx_high:
+            trace.append(float(row[idx_low]))
+            continue
+
+        frac = float(idx_float - idx_low)
+        trace.append(float((1.0 - frac) * row[idx_low] + frac * row[idx_high]))
 
     return y_voltage_kv.astype(np.float64), topt_values, np.asarray(trace, dtype=np.float64)

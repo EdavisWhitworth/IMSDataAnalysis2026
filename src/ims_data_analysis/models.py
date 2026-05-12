@@ -172,6 +172,10 @@ class ExperimentConfig:
     averages_per_iteration: int = 10
     total_iterations: int = 50
     positive_mode: bool = False
+    pressure_torr: float | None = None
+    temperature_c: float | None = None
+    length_cm: float | None = None
+    gate_multiplier: float | None = None
     ftims_config: FTIMSConfig = field(default_factory=FTIMSConfig)
     swept_ftims_config: SweptFTIMSConfig = field(default_factory=SweptFTIMSConfig)
     vsims_config: SteppedVSIMSConfig = field(default_factory=SteppedVSIMSConfig)
@@ -193,6 +197,12 @@ class ExperimentConfig:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "ExperimentConfig":
+        def _first_value(*keys: str) -> Any:
+            for key in keys:
+                if key in raw and raw.get(key) is not None:
+                    return raw.get(key)
+            return None
+
         mode_value = str(raw.get("operation_mode", "DTIMS"))
         try:
             mode = OperationMode(mode_value)
@@ -208,6 +218,11 @@ class ExperimentConfig:
         swept_vsims_config_dict = raw.get("swept_vsims_config")
         swept_vsims_config = SweptVSIMSConfig.from_dict(swept_vsims_config_dict) if swept_vsims_config_dict else SweptVSIMSConfig()
 
+        pressure_value = _first_value("pressure_torr", "pressure")
+        temperature_value = _first_value("temperature_c", "temperature")
+        length_value = _first_value("length_cm", "drift_length_cm", "drift_length")
+        gate_multiplier_value = _first_value("gate_multiplier", "gate_mult", "gate_voltage_multiplier")
+
         return cls(
             operation_mode=mode,
             pulse_width_ms=float(raw.get("pulse_width_ms", 1.0)),
@@ -216,6 +231,10 @@ class ExperimentConfig:
             averages_per_iteration=int(raw.get("averages_per_iteration", 10)),
             total_iterations=int(raw.get("total_iterations", 50)),
             positive_mode=bool(raw.get("positive_mode", False)),
+            pressure_torr=(None if pressure_value is None else float(pressure_value)),
+            temperature_c=(None if temperature_value is None else float(temperature_value)),
+            length_cm=(None if length_value is None else float(length_value)),
+            gate_multiplier=(None if gate_multiplier_value is None else float(gate_multiplier_value)),
             ftims_config=ftims_config,
             swept_ftims_config=swept_ftims_config,
             vsims_config=vsims_config,

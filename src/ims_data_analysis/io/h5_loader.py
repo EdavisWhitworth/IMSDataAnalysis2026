@@ -13,20 +13,35 @@ class H5LoadError(RuntimeError):
     pass
 
 
-def _parse_config(config_group: h5py.Group) -> ExperimentConfig:
+def _parse_config(config_group: h5py.Group, h5_file: h5py.File | None = None) -> ExperimentConfig:
     raw_json = config_group.attrs.get("config_json")
     if raw_json is not None:
         if isinstance(raw_json, bytes):
             raw_json = raw_json.decode("utf-8", errors="replace")
-        return ExperimentConfig.from_dict(json.loads(str(raw_json)))
+        config_dict = json.loads(str(raw_json))
+    else:
+        # Fallback: flatten scalar attrs
+        config_dict = {}
+        for key, value in dict(config_group.attrs).items():
+            if isinstance(value, np.generic):
+                config_dict[key] = value.item()
+            else:
+                config_dict[key] = value
 
-    raw_attrs: dict[str, object] = {}
-    for key, value in dict(config_group.attrs).items():
-        if isinstance(value, np.generic):
-            raw_attrs[key] = value.item()
-        else:
-            raw_attrs[key] = value
-    return ExperimentConfig.from_dict(raw_attrs)
+    # If user_params group exists, merge those values into the config dict
+    # (IMSControl2026 stores metadata there)
+    if h5_file is not None:
+        user_params_group = h5_file.get("user_params")
+        if isinstance(user_params_group, h5py.Group):
+            for key in ["pressure_torr", "temperature_c", "length_cm", "gate_multiplier"]:
+                if key in user_params_group.attrs:
+                    value = user_params_group.attrs[key]
+                    if isinstance(value, np.generic):
+                        config_dict[key] = float(value.item())
+                    else:
+                        config_dict[key] = float(value)
+
+    return ExperimentConfig.from_dict(config_dict)
 
 
 def load_h5_experiment(file_path: str) -> LoadedExperiment:
@@ -40,7 +55,7 @@ def load_h5_experiment(file_path: str) -> LoadedExperiment:
         if "iterations" not in handle:
             raise H5LoadError("H5 file is missing required /iterations group")
 
-        config = _parse_config(handle["config"])
+        config = _parse_config(handle["config"], h5_file=handle)
         created_at = str(handle.attrs.get("created_at", ""))
 
         datasets: list[np.ndarray] = []

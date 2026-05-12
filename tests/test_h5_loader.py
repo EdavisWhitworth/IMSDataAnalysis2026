@@ -29,6 +29,13 @@ def _write_minimal_h5(path: Path, include_json: bool = True, bad_lengths: bool =
             for key, value in config_dict.items():
                 cfg.attrs[key] = value
 
+        # Metadata stored separately in user_params group (matching IMSControl2026 format)
+        user_params = handle.create_group("user_params")
+        user_params.attrs["pressure_torr"] = 740.0
+        user_params.attrs["temperature_c"] = 30.0
+        user_params.attrs["length_cm"] = 12.5
+        user_params.attrs["gate_multiplier"] = 0.85
+
         iters = handle.create_group("iterations")
         iters.create_dataset("iteration_1", data=np.linspace(0.0, 1.0, 10))
         if bad_lengths:
@@ -43,6 +50,10 @@ def test_load_h5_with_config_json(tmp_path: Path) -> None:
 
     loaded = load_h5_experiment(str(target))
     assert loaded.config.operation_mode.value == "DTIMS"
+    assert loaded.config.pressure_torr == pytest.approx(740.0)
+    assert loaded.config.temperature_c == pytest.approx(30.0)
+    assert loaded.config.length_cm == pytest.approx(12.5)
+    assert loaded.config.gate_multiplier == pytest.approx(0.85)
     assert loaded.matrix.shape == (2, 10)
 
 
@@ -52,6 +63,10 @@ def test_load_h5_with_flat_attrs_fallback(tmp_path: Path) -> None:
 
     loaded = load_h5_experiment(str(target))
     assert loaded.config.data_points == 10
+    assert loaded.config.pressure_torr == pytest.approx(740.0)
+    assert loaded.config.temperature_c == pytest.approx(30.0)
+    assert loaded.config.length_cm == pytest.approx(12.5)
+    assert loaded.config.gate_multiplier == pytest.approx(0.85)
     assert loaded.matrix.shape == (2, 10)
 
 

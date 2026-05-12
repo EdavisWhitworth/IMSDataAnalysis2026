@@ -31,13 +31,14 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QSpinBox,
+    QTabWidget,
 )
 
-from ims_data_analysis.analysis.metrics import detect_all_peaks, detect_nearest_peak
+from ims_data_analysis.analysis.metrics import compute_ko, detect_all_peaks, detect_nearest_peak
 from ims_data_analysis.analysis.mode_transform import build_mode_view
 from ims_data_analysis.analysis.vsims_optimizer import extract_optimized_trace
 from ims_data_analysis.io.h5_loader import H5LoadError, load_h5_experiment
-from ims_data_analysis.io.user_settings import UserSettings, load_user_settings, save_user_settings
+from ims_data_analysis.io.user_settings import SpectrumStyleSettings, UserSettings, load_user_settings, save_user_settings
 from ims_data_analysis.models import LoadedExperiment, ModeView, OperationMode
 
 
@@ -62,7 +63,13 @@ class MainWindow(QMainWindow):
         self.mode_view: ModeView | None = None
         self.current_row: int = 0
         self.cursor_x: float = 0.0
+        self.optimized_cursor_x: float = 0.0
+        self._active_spectrum_target = "selected"
         self.user_settings: UserSettings = load_user_settings()
+        self._selected_style = self.user_settings.selected_spectrum_style
+        self._optimized_style = self.user_settings.optimized_spectrum_style
+        if self.user_settings.vs_step_table_target in {"selected", "optimized"}:
+            self._active_spectrum_target = self.user_settings.vs_step_table_target
 
         self._build_ui()
 
@@ -103,6 +110,7 @@ class MainWindow(QMainWindow):
 
         self.peak_mode_combo = QComboBox()
         self.peak_mode_combo.addItems(["All peaks", "Nearest to cursor"])
+        self.subtract_baseline_checkbox = QCheckBox("Subtract baseline")
 
         param_form.addRow("Pressure P (Torr):", self.pressure_spin)
         param_form.addRow("Temperature T (C):", self.temperature_spin)
@@ -114,6 +122,7 @@ class MainWindow(QMainWindow):
         param_form.addRow("Min Prominence:", self.min_prom_spin)
         param_form.addRow("Min SNR:", self.min_snr_spin)
         param_form.addRow("Peak Detection:", self.peak_mode_combo)
+        param_form.addRow(self.subtract_baseline_checkbox)
         control_layout.addWidget(param_group)
 
         metadata_group = QGroupBox("Metadata Overrides")
@@ -132,7 +141,7 @@ class MainWindow(QMainWindow):
         self.voltage_override_checkbox = QCheckBox("Override voltage metadata")
         self.voltage_override_spin = self._spin(0.0, 100.0, 0.0, 0.01)
         self.voltage_override_missing_only_checkbox = QCheckBox("Apply voltage override only when metadata missing")
-        self.save_settings_btn = QPushButton("Save Override Settings")
+        self.save_settings_btn = QPushButton("Save Settings")
         self.save_settings_btn.clicked.connect(self._save_settings)
 
         metadata_form.addRow(self.mode_override_checkbox)
@@ -210,9 +219,6 @@ class MainWindow(QMainWindow):
         control_layout.addStretch(1)
         left_control_panel.setMinimumWidth(340)
 
-        splitter = QSplitter(QtCore.Qt.Vertical)
-        self._main_splitter = splitter
-
         self.heatmap_panel = QWidget()
         heatmap_layout = QHBoxLayout(self.heatmap_panel)
         heatmap_layout.setContentsMargins(0, 0, 0, 0)
@@ -234,35 +240,55 @@ class MainWindow(QMainWindow):
 
         self.heat_overlay_curve = pg.PlotDataItem(pen=pg.mkPen(color="#ffd43b", width=2, style=QtCore.Qt.DashLine))
         self.heat_plot.addItem(self.heat_overlay_curve)
+        self.heat_cursor_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ffffff", width=3))
+        self.heat_cursor_line.setZValue(10)
+        self.heat_plot.addItem(self.heat_cursor_line)
         self.heat_plot.scene().sigMouseClicked.connect(self._on_heat_click)
 
         self.spectrum_plot = pg.PlotWidget(title="Selected Spectrum")
+        self.spectrum_plot.setMouseEnabled(x=False, y=False)
+        self.spectrum_plot.setMenuEnabled(False)
         self.spectrum_plot.setLabel("bottom", "X")
         self.spectrum_plot.setLabel("left", "Signal")
-        self.spectrum_curve = self.spectrum_plot.plot([], [], pen=pg.mkPen(color=self.spectrum_curve_color, width=2))
+        self.spectrum_curve = self.spectrum_plot.plot([], [], pen=pg.mkPen(color=self._selected_style.curve_color, width=2))
         self.noise_markers = pg.ScatterPlotItem(
             size=4,
             symbol="o",
-            pen=pg.mkPen(color=self.baseline_color, width=1),
-            brush=pg.mkBrush(self._color_with_alpha(self.baseline_color, 170)),
+            pen=pg.mkPen(color=self._selected_style.baseline_color, width=1),
+            brush=pg.mkBrush(self._color_with_alpha(self._selected_style.baseline_color, 170)),
         )
         self.spectrum_plot.addItem(self.noise_markers)
         self.peak_markers = pg.ScatterPlotItem(
             size=11,
             symbol="o",
-            pen=pg.mkPen(color=self.peak_color, width=2),
+            pen=pg.mkPen(color=self._selected_style.peak_color, width=2),
             brush=pg.mkBrush(255, 236, 153, 200),
         )
         self.spectrum_plot.addItem(self.peak_markers)
-        self.cursor_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(self.cursor_color, width=1.5))
+        self.cursor_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(self._selected_style.cursor_color, width=1.5))
         self.spectrum_plot.addItem(self.cursor_line)
         self.spectrum_plot.scene().sigMouseClicked.connect(self._on_spectrum_click)
 
         self.optimized_plot = pg.PlotWidget(title="Stepped VSIMS Optimized Spectrum")
-        self.optimized_plot.setLabel("bottom", "Voltage (kV)")
+        self.optimized_plot.setMouseEnabled(x=False, y=False)
+        self.optimized_plot.setMenuEnabled(False)
+        self.optimized_plot.setLabel("bottom", "Optimized Drift Time (ms)")
         self.optimized_plot.setLabel("left", "Signal")
-        self.optimized_curve = self.optimized_plot.plot([], [], pen=pg.mkPen(color="#f08c00", width=2))
-        self.optimized_plot.hide()
+        self.optimized_curve = self.optimized_plot.plot([], [], pen=pg.mkPen(color=self._optimized_style.curve_color, width=2))
+        self.optimized_peak_markers = pg.ScatterPlotItem(
+            size=10,
+            symbol="o",
+            pen=pg.mkPen(color=self._optimized_style.peak_color, width=2),
+            brush=pg.mkBrush(255, 236, 153, 200),
+        )
+        self.optimized_plot.addItem(self.optimized_peak_markers)
+        self.optimized_cursor_line = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=pg.mkPen(self._optimized_style.cursor_color, width=1.5),
+        )
+        self.optimized_plot.addItem(self.optimized_cursor_line)
+        self.optimized_plot.scene().sigMouseClicked.connect(self._on_optimized_spectrum_click)
 
         self.peak_table = QTableWidget(0, 7)
         self.peak_table.setHorizontalHeaderLabels(
@@ -270,49 +296,46 @@ class MainWindow(QMainWindow):
         )
         self.peak_table.horizontalHeader().setStretchLastSection(True)
 
-        splitter.addWidget(self.heatmap_panel)
-        splitter.addWidget(self.spectrum_plot)
-        splitter.addWidget(self.optimized_plot)
-        splitter.addWidget(self.peak_table)
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 3)
-        splitter.setStretchFactor(2, 2)
-        splitter.setStretchFactor(3, 3)
+        self.selected_axis_controls = self._build_axis_controls("Spectrum Axis Controls", "selected")
 
-        # Right panel uses a hidden-handle splitter that stays in sync with the main splitter.
-        # pane 0 → heatmap row  (holds Export group)
-        # pane 1 → spectrum row (holds Spectrum Style group)
-        # pane 2 → table/optimised row (empty spacer)
-        self._right_splitter = QSplitter(QtCore.Qt.Vertical)
-        self._right_splitter.setHandleWidth(0)
-        self._right_splitter.setChildrenCollapsible(False)
+        self.selected_plot_page = QWidget()
+        selected_layout = QVBoxLayout(self.selected_plot_page)
+        selected_layout.setContentsMargins(0, 0, 0, 0)
+        selected_layout.addWidget(self.spectrum_plot)
+        selected_layout.addWidget(self.selected_axis_controls)
+        selected_layout.addWidget(self.peak_table)
 
-        _export_container = QWidget()
-        _ec_layout = QVBoxLayout(_export_container)
-        _ec_layout.setContentsMargins(0, 0, 0, 0)
-        _ec_layout.addWidget(export_group)
-        _ec_layout.addStretch(1)
+        self.optimized_peak_table = QTableWidget(0, 7)
+        self.optimized_peak_table.setHorizontalHeaderLabels(
+            ["Optimized t (ms)", "Voltage (kV)", "Intensity", "SNR", "Ko", "FWHM", "Resolving Power"]
+        )
+        self.optimized_peak_table.horizontalHeader().setStretchLastSection(True)
 
-        _style_container = QWidget()
-        _sc_layout = QVBoxLayout(_style_container)
-        _sc_layout.setContentsMargins(0, 0, 0, 0)
-        _sc_layout.addWidget(style_group)
-        _sc_layout.addStretch(1)
+        self.optimized_axis_controls = self._build_axis_controls("Optimized Axis Controls", "optimized")
 
-        _bottom_spacer = QWidget()
+        self.optimized_plot_page = QWidget()
+        optimized_layout = QVBoxLayout(self.optimized_plot_page)
+        optimized_layout.setContentsMargins(0, 0, 0, 0)
+        optimized_layout.addWidget(self.optimized_plot)
+        optimized_layout.addWidget(self.optimized_axis_controls)
+        optimized_layout.addWidget(self.optimized_peak_table)
 
-        self._right_splitter.addWidget(_export_container)
-        self._right_splitter.addWidget(_style_container)
-        self._right_splitter.addWidget(_bottom_spacer)
+        self.plot_tabs = QTabWidget()
+        self.plot_tabs.addTab(self.heatmap_panel, "Heatmap")
+        self.plot_tabs.addTab(self.selected_plot_page, "Spectrum")
+        self.plot_tabs.addTab(self.optimized_plot_page, "Optimized Spectrum")
+        self.plot_tabs.currentChanged.connect(self._on_plot_tab_changed)
 
         right_control_panel = QWidget()
         right_control_layout = QVBoxLayout(right_control_panel)
         right_control_layout.setContentsMargins(0, 0, 0, 0)
-        right_control_layout.addWidget(self._right_splitter)
+        right_control_layout.addWidget(export_group)
+        right_control_layout.addWidget(style_group)
+        right_control_layout.addStretch(1)
         right_control_panel.setMinimumWidth(360)
 
         layout.addWidget(left_control_panel)
-        layout.addWidget(splitter, stretch=1)
+        layout.addWidget(self.plot_tabs, stretch=1)
         layout.addWidget(right_control_panel)
 
         for widget in [
@@ -328,6 +351,7 @@ class MainWindow(QMainWindow):
         ]:
             widget.valueChanged.connect(self._refresh_analysis)
         self.peak_mode_combo.currentIndexChanged.connect(self._refresh_analysis)
+        self.subtract_baseline_checkbox.toggled.connect(self._on_baseline_subtraction_toggled)
         self.mode_override_checkbox.toggled.connect(self._on_override_controls_changed)
         self.mode_override_combo.currentIndexChanged.connect(self._on_override_controls_changed)
         self.voltage_override_checkbox.toggled.connect(self._on_override_controls_changed)
@@ -335,22 +359,10 @@ class MainWindow(QMainWindow):
         self.voltage_override_missing_only_checkbox.toggled.connect(self._on_override_controls_changed)
 
         self._apply_loaded_settings_to_controls()
-        self.font_family_combo.setCurrentFont(QFont(self.spectrum_font_family))
-        self._sync_color_button_labels()
-        self._apply_spectrum_style()
-        splitter.splitterMoved.connect(self._sync_right_splitter)
-        # initialise right splitter after event loop starts so sizes are available
-        QtCore.QTimer.singleShot(0, lambda: self._sync_right_splitter())
-
-    def _sync_right_splitter(self, *_args) -> None:
-        """Keep the right-panel splitter aligned with the main content splitter."""
-        sizes = self._main_splitter.sizes()
-        if not sizes or sum(sizes) == 0:
-            return
-        heatmap_sz = sizes[0]
-        spectrum_sz = sizes[1]
-        rest_sz = sum(sizes[2:])
-        self._right_splitter.setSizes([heatmap_sz, spectrum_sz, rest_sz])
+        self._load_style_controls_from_target()
+        self._apply_all_spectrum_styles()
+        self._update_plot_tab_availability()
+        self._activate_preferred_plot_tab()
 
     def _spin(self, minimum: float, maximum: float, value: float, step: float) -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
@@ -365,24 +377,78 @@ class MainWindow(QMainWindow):
         color.setAlpha(int(np.clip(alpha, 0, 255)))
         return color
 
+    def _build_axis_controls(self, title: str, target: str) -> QWidget:
+        group = QGroupBox(title)
+        form = QFormLayout(group)
+
+        x_min_spin = self._spin(-1e12, 1e12, 0.0, 0.1)
+        x_max_spin = self._spin(-1e12, 1e12, 1.0, 0.1)
+        y_min_spin = self._spin(-1e12, 1e12, 0.0, 0.1)
+        y_max_spin = self._spin(-1e12, 1e12, 1.0, 0.1)
+        reset_x_btn = QPushButton("Reset X to Data")
+        reset_y_btn = QPushButton("Reset Y to Data")
+
+        x_row = QWidget()
+        x_layout = QHBoxLayout(x_row)
+        x_layout.setContentsMargins(0, 0, 0, 0)
+        x_layout.addWidget(QLabel("Min"))
+        x_layout.addWidget(x_min_spin)
+        x_layout.addWidget(QLabel("Max"))
+        x_layout.addWidget(x_max_spin)
+        x_layout.addWidget(reset_x_btn)
+
+        y_row = QWidget()
+        y_layout = QHBoxLayout(y_row)
+        y_layout.setContentsMargins(0, 0, 0, 0)
+        y_layout.addWidget(QLabel("Min"))
+        y_layout.addWidget(y_min_spin)
+        y_layout.addWidget(QLabel("Max"))
+        y_layout.addWidget(y_max_spin)
+        y_layout.addWidget(reset_y_btn)
+
+        form.addRow("X Axis:", x_row)
+        form.addRow("Y Axis:", y_row)
+
+        controls = {
+            "widget": group,
+            "x_min": x_min_spin,
+            "x_max": x_max_spin,
+            "y_min": y_min_spin,
+            "y_max": y_max_spin,
+        }
+        setattr(self, f"_{target}_axis_controls", controls)
+
+        x_min_spin.valueChanged.connect(lambda *_: self._apply_axis_ranges(target))
+        x_max_spin.valueChanged.connect(lambda *_: self._apply_axis_ranges(target))
+        y_min_spin.valueChanged.connect(lambda *_: self._apply_axis_ranges(target))
+        y_max_spin.valueChanged.connect(lambda *_: self._apply_axis_ranges(target))
+        reset_x_btn.clicked.connect(lambda: self._reset_axis_to_data(target, "x"))
+        reset_y_btn.clicked.connect(lambda: self._reset_axis_to_data(target, "y"))
+        return group
+
     def _pick_color(self, attr_name: str, button: QPushButton) -> None:
+        if self._active_style_target() is None:
+            return
         current = QColor(getattr(self, attr_name))
         chosen = QColorDialog.getColor(current, self, "Select Color")
         if not chosen.isValid():
             return
         setattr(self, attr_name, chosen.name())
         button.setText(chosen.name())
-        self._apply_spectrum_style()
+        self._store_active_style_from_controls()
+        self._apply_active_spectrum_style()
 
     def _on_spectrum_font_changed(self, *_args) -> None:
         self.spectrum_font_family = self.font_family_combo.currentFont().family()
         self.spectrum_font_size = int(self.font_size_spin.value())
-        self._apply_spectrum_style()
+        self._store_active_style_from_controls()
+        self._apply_active_spectrum_style()
 
     def _on_spectrum_title_changed(self, *_args) -> None:
         self.spectrum_title_text = self.title_edit.text().strip()
         self.spectrum_show_title = self.show_title_checkbox.isChecked()
-        self._apply_spectrum_style()
+        self._store_active_style_from_controls()
+        self._apply_active_spectrum_style()
 
     def _sync_color_button_labels(self) -> None:
         self.curve_color_btn.setText(self.spectrum_curve_color)
@@ -392,37 +458,281 @@ class MainWindow(QMainWindow):
         self.bg_color_btn.setText(self.spectrum_background_color)
         self.text_color_btn.setText(self.spectrum_text_color)
 
-    def _apply_spectrum_style(self) -> None:
-        self.spectrum_curve.setPen(pg.mkPen(color=self.spectrum_curve_color, width=2))
-        self.noise_markers.setPen(pg.mkPen(color=self.baseline_color, width=1))
-        self.noise_markers.setBrush(pg.mkBrush(self._color_with_alpha(self.baseline_color, 170)))
-        self.peak_markers.setPen(pg.mkPen(color=self.peak_color, width=2))
-        self.cursor_line.setPen(pg.mkPen(self.cursor_color, width=1.5))
-        self.spectrum_plot.setBackground(self.spectrum_background_color)
+    def _current_plot_tab_kind(self) -> str | None:
+        if not hasattr(self, "plot_tabs"):
+            return None
+        index = self.plot_tabs.currentIndex()
+        if index == 0:
+            return "heatmap"
+        if index == 1:
+            return "selected"
+        if index == 2:
+            return "optimized"
+        return None
 
-        font = QFont(self.spectrum_font_family, self.spectrum_font_size)
-        css_size = f"{self.spectrum_font_size}pt"
-        text_style = {"color": self.spectrum_text_color, "font-size": css_size}
-        self.spectrum_plot.setLabel("bottom", self.mode_view.x_label if self.mode_view else "X", **text_style)
-        self.spectrum_plot.setLabel("left", "Signal", **text_style)
-        if self.spectrum_show_title:
-            title_text = self.spectrum_title_text or "Selected Spectrum"
-            self.spectrum_plot.setTitle(
+    def _active_style_target(self) -> str | None:
+        kind = self._current_plot_tab_kind()
+        if kind in {"selected", "optimized"}:
+            return kind
+        return None
+
+    def _active_peak_table(self) -> QTableWidget:
+        return self.optimized_peak_table if self._active_style_target() == "optimized" else self.peak_table
+
+    def _active_spectrum_plot(self) -> pg.PlotWidget:
+        return self.optimized_plot if self._active_style_target() == "optimized" else self.spectrum_plot
+
+    def _axis_controls_for_target(self, target: str) -> dict[str, object]:
+        return getattr(self, f"_{target}_axis_controls")
+
+    def _update_axis_controls_from_data(self, target: str, x: np.ndarray, y: np.ndarray) -> None:
+        if x.size == 0 or y.size == 0:
+            return
+        controls = self._axis_controls_for_target(target)
+        for key, values in (("x_min", x), ("x_max", x), ("y_min", y), ("y_max", y)):
+            spin = controls[key]
+            spin.blockSignals(True)
+            try:
+                spin.setValue(float(np.min(values)) if key.endswith("min") else float(np.max(values)))
+            finally:
+                spin.blockSignals(False)
+        self._apply_axis_ranges(target)
+
+    def _sync_axis_controls_to_current_data(self, target: str) -> None:
+        if self.mode_view is None:
+            return
+        if target == "optimized":
+            x_data, y_data = self.optimized_curve.getData()
+        else:
+            x_data = self.mode_view.x_axis
+            y_data = self._display_row(self.current_row)
+        x_arr = np.asarray([] if x_data is None else x_data, dtype=np.float64)
+        y_arr = np.asarray([] if y_data is None else y_data, dtype=np.float64)
+        self._update_axis_controls_from_data(target, x_arr, y_arr)
+
+    def _apply_axis_ranges(self, target: str) -> None:
+        controls = self._axis_controls_for_target(target)
+        plot_widget = self.spectrum_plot if target == "selected" else self.optimized_plot
+        x_min = min(float(controls["x_min"].value()), float(controls["x_max"].value()))
+        x_max = max(float(controls["x_min"].value()), float(controls["x_max"].value()))
+        y_min = min(float(controls["y_min"].value()), float(controls["y_max"].value()))
+        y_max = max(float(controls["y_min"].value()), float(controls["y_max"].value()))
+        plot_widget.setXRange(x_min, x_max, padding=0)
+        plot_widget.setYRange(y_min, y_max, padding=0)
+
+    def _reset_axis_to_data(self, target: str, axis: str) -> None:
+        x_data, y_data = self._current_curve_data(target)
+        if x_data.size == 0 or y_data.size == 0:
+            return
+        controls = self._axis_controls_for_target(target)
+        if axis == "x":
+            controls["x_min"].blockSignals(True)
+            controls["x_max"].blockSignals(True)
+            try:
+                controls["x_min"].setValue(float(np.min(x_data)))
+                controls["x_max"].setValue(float(np.max(x_data)))
+            finally:
+                controls["x_min"].blockSignals(False)
+                controls["x_max"].blockSignals(False)
+        else:
+            controls["y_min"].blockSignals(True)
+            controls["y_max"].blockSignals(True)
+            try:
+                controls["y_min"].setValue(float(np.min(y_data)))
+                controls["y_max"].setValue(float(np.max(y_data)))
+            finally:
+                controls["y_min"].blockSignals(False)
+                controls["y_max"].blockSignals(False)
+        self._apply_axis_ranges(target)
+
+    def _current_curve_data(self, target: str) -> tuple[np.ndarray, np.ndarray]:
+        if target == "optimized":
+            x_data, y_data = self.optimized_curve.getData()
+        else:
+            x_data, y_data = self.spectrum_curve.getData()
+        x_arr = np.asarray([] if x_data is None else x_data, dtype=np.float64)
+        y_arr = np.asarray([] if y_data is None else y_data, dtype=np.float64)
+        return x_arr, y_arr
+
+    def _style_for_target(self, target: str) -> SpectrumStyleSettings:
+        return self._optimized_style if target == "optimized" else self._selected_style
+
+    def _store_active_style_from_controls(self) -> None:
+        target = self._active_style_target()
+        if target is None:
+            return
+        style = self._style_for_target(target)
+        style.curve_color = self.spectrum_curve_color
+        style.baseline_color = self.baseline_color
+        style.peak_color = self.peak_color
+        style.cursor_color = self.cursor_color
+        style.background_color = self.spectrum_background_color
+        style.text_color = self.spectrum_text_color
+        style.font_family = self.spectrum_font_family
+        style.font_size = self.spectrum_font_size
+        style.title_text = self.spectrum_title_text
+        style.show_title = self.spectrum_show_title
+
+    def _load_style_controls_from_target(self) -> None:
+        target = self._active_style_target() or self._active_spectrum_target
+        style = self._style_for_target(target)
+        self.spectrum_curve_color = style.curve_color
+        self.baseline_color = style.baseline_color
+        self.peak_color = style.peak_color
+        self.cursor_color = style.cursor_color
+        self.spectrum_background_color = style.background_color
+        self.spectrum_text_color = style.text_color
+        self.spectrum_font_family = style.font_family
+        self.spectrum_font_size = int(style.font_size)
+        self.spectrum_title_text = style.title_text
+        self.spectrum_show_title = bool(style.show_title)
+
+        self.curve_color_btn.setText(self.spectrum_curve_color)
+        self.baseline_color_btn.setText(self.baseline_color)
+        self.peak_color_btn.setText(self.peak_color)
+        self.cursor_color_btn.setText(self.cursor_color)
+        self.bg_color_btn.setText(self.spectrum_background_color)
+        self.text_color_btn.setText(self.spectrum_text_color)
+
+        self.font_family_combo.blockSignals(True)
+        self.font_size_spin.blockSignals(True)
+        self.title_edit.blockSignals(True)
+        self.show_title_checkbox.blockSignals(True)
+        try:
+            self.font_family_combo.setCurrentFont(QFont(self.spectrum_font_family))
+            self.font_size_spin.setValue(self.spectrum_font_size)
+            self.title_edit.setText(self.spectrum_title_text)
+            self.show_title_checkbox.setChecked(self.spectrum_show_title)
+        finally:
+            self.font_family_combo.blockSignals(False)
+            self.font_size_spin.blockSignals(False)
+            self.title_edit.blockSignals(False)
+            self.show_title_checkbox.blockSignals(False)
+
+    def _update_spectrum_controls_enabled(self) -> None:
+        active_target = self._active_style_target()
+        enabled = active_target is not None
+        for widget in [
+            self.curve_color_btn,
+            self.baseline_color_btn,
+            self.peak_color_btn,
+            self.cursor_color_btn,
+            self.bg_color_btn,
+            self.text_color_btn,
+            self.font_family_combo,
+            self.font_size_spin,
+            self.title_edit,
+            self.show_title_checkbox,
+            self.export_spectrum_btn,
+            self.export_spectrum_csv_btn,
+            self.export_table_csv_btn,
+            self.selected_axis_controls,
+            self.optimized_axis_controls,
+        ]:
+            widget.setEnabled(enabled)
+
+    def _update_plot_tab_availability(self) -> None:
+        is_step_vsims = self.mode_view is not None and self.mode_view.mode == OperationMode.STEPPED_VSIMS
+        self.plot_tabs.setTabEnabled(2, is_step_vsims)
+        if not is_step_vsims and self.plot_tabs.currentIndex() == 2:
+            self.plot_tabs.setCurrentIndex(1)
+
+    def _on_plot_tab_changed(self, index: int) -> None:
+        if index == 0:
+            self._active_spectrum_target = self._active_spectrum_target if self._active_spectrum_target in {"selected", "optimized"} else "selected"
+            self._update_spectrum_controls_enabled()
+            return
+
+        self._active_spectrum_target = "optimized" if index == 2 else "selected"
+        self._load_style_controls_from_target()
+        self._update_spectrum_controls_enabled()
+        self._apply_active_spectrum_style()
+
+    def _apply_style_to_plot(self, plot_widget: pg.PlotWidget, curve_item: pg.PlotDataItem, peak_item: pg.ScatterPlotItem, cursor_item: pg.InfiniteLine | None, style: SpectrumStyleSettings, x_label: str, selected: bool) -> None:
+        curve_item.setPen(pg.mkPen(color=style.curve_color, width=2))
+        peak_item.setPen(pg.mkPen(color=style.peak_color, width=2))
+        if cursor_item is not None:
+            cursor_item.setPen(pg.mkPen(style.cursor_color, width=1.5))
+        plot_widget.setBackground(style.background_color)
+
+        font = QFont(style.font_family, style.font_size)
+        css_size = f"{style.font_size}pt"
+        text_style = {"color": style.text_color, "font-size": css_size}
+        plot_widget.setLabel("bottom", x_label, **text_style)
+        plot_widget.setLabel("left", "Signal", **text_style)
+        if style.show_title:
+            title_text = style.title_text or ("Selected Spectrum" if selected else "Optimized Spectrum")
+            plot_widget.setTitle(
                 (
-                    f"<span style='color:{self.spectrum_text_color};"
-                    f" font-family:{self.spectrum_font_family}; font-size:{css_size};'>"
+                    f"<span style='color:{style.text_color};"
+                    f" font-family:{style.font_family}; font-size:{css_size};'>"
                     f"{title_text}"
                     "</span>"
                 )
             )
         else:
-            self.spectrum_plot.setTitle("")
-        self.spectrum_plot.getAxis("bottom").setPen(pg.mkPen(self.spectrum_text_color))
-        self.spectrum_plot.getAxis("left").setPen(pg.mkPen(self.spectrum_text_color))
-        self.spectrum_plot.getAxis("bottom").setTextPen(pg.mkPen(self.spectrum_text_color))
-        self.spectrum_plot.getAxis("left").setTextPen(pg.mkPen(self.spectrum_text_color))
-        self.spectrum_plot.getAxis("bottom").setStyle(tickFont=font)
-        self.spectrum_plot.getAxis("left").setStyle(tickFont=font)
+            plot_widget.setTitle("")
+        plot_widget.getAxis("bottom").setPen(pg.mkPen(style.text_color))
+        plot_widget.getAxis("left").setPen(pg.mkPen(style.text_color))
+        plot_widget.getAxis("bottom").setTextPen(pg.mkPen(style.text_color))
+        plot_widget.getAxis("left").setTextPen(pg.mkPen(style.text_color))
+        plot_widget.getAxis("bottom").setStyle(tickFont=font)
+        plot_widget.getAxis("left").setStyle(tickFont=font)
+
+    def _apply_all_spectrum_styles(self) -> None:
+        self._apply_style_to_plot(
+            self.spectrum_plot,
+            self.spectrum_curve,
+            self.peak_markers,
+            self.cursor_line,
+            self._selected_style,
+            self.mode_view.x_label if self.mode_view else "X",
+            True,
+        )
+        self.noise_markers.setPen(pg.mkPen(color=self._selected_style.baseline_color, width=1))
+        self.noise_markers.setBrush(pg.mkBrush(self._color_with_alpha(self._selected_style.baseline_color, 170)))
+        self._apply_style_to_plot(
+            self.optimized_plot,
+            self.optimized_curve,
+            self.optimized_peak_markers,
+            self.optimized_cursor_line,
+            self._optimized_style,
+            "Optimized Drift Time (ms)",
+            False,
+        )
+
+    def _apply_active_spectrum_style(self) -> None:
+        target = self._active_style_target()
+        if target is None:
+            return
+        style = self._style_for_target(target)
+        self._apply_style_to_plot(
+            self.spectrum_plot if target == "selected" else self.optimized_plot,
+            self.spectrum_curve if target == "selected" else self.optimized_curve,
+            self.peak_markers if target == "selected" else self.optimized_peak_markers,
+            self.cursor_line if target == "selected" else self.optimized_cursor_line,
+            style,
+            self.mode_view.x_label if (target == "selected" and self.mode_view is not None) else "Optimized Drift Time (ms)",
+            target == "selected",
+        )
+        if target == "selected":
+            self.noise_markers.setPen(pg.mkPen(color=style.baseline_color, width=1))
+            self.noise_markers.setBrush(pg.mkBrush(self._color_with_alpha(style.baseline_color, 170)))
+
+    def _update_heatmap_cursor(self) -> None:
+        if self.mode_view is None or self.mode_view.mode != OperationMode.STEPPED_VSIMS or self.mode_view.voltage_axis_kv is None:
+            self.heat_cursor_line.setVisible(False)
+            return
+
+        self.heat_cursor_line.setVisible(True)
+        row = int(np.clip(self.current_row, 0, self.mode_view.voltage_axis_kv.size - 1))
+        self.heat_cursor_line.setPos(float(self.mode_view.voltage_axis_kv[row]))
+
+    def _activate_preferred_plot_tab(self) -> None:
+        if self.mode_view is not None and self.mode_view.mode == OperationMode.STEPPED_VSIMS and self._active_spectrum_target == "optimized":
+            self.plot_tabs.setCurrentIndex(2)
+        else:
+            self.plot_tabs.setCurrentIndex(1)
 
     def _apply_loaded_settings_to_controls(self) -> None:
         self.mode_override_checkbox.setChecked(self.user_settings.mode_override_enabled)
@@ -435,13 +745,39 @@ class MainWindow(QMainWindow):
             self.user_settings.voltage_override_only_when_missing
         )
 
+    def _apply_loaded_experiment_parameters(self) -> None:
+        if self.loaded is None:
+            return
+
+        cfg = self.loaded.config
+        updates = [
+            (self.pressure_spin, cfg.pressure_torr),
+            (self.temperature_spin, cfg.temperature_c),
+            (self.length_spin, cfg.length_cm),
+            (self.gate_mult_spin, cfg.gate_multiplier),
+        ]
+        for widget, value in updates:
+            if value is None:
+                continue
+            widget.blockSignals(True)
+            try:
+                widget.setValue(float(value))
+            finally:
+                widget.blockSignals(False)
+
+        self._refresh_analysis()
+
     def _capture_settings_from_controls(self) -> UserSettings:
+        self._store_active_style_from_controls()
         return UserSettings(
             mode_override_enabled=self.mode_override_checkbox.isChecked(),
             mode_override_value=self.mode_override_combo.currentText(),
             voltage_override_enabled=self.voltage_override_checkbox.isChecked(),
             voltage_override_kv=float(self.voltage_override_spin.value()),
             voltage_override_only_when_missing=self.voltage_override_missing_only_checkbox.isChecked(),
+            vs_step_table_target=self._active_spectrum_target,
+            selected_spectrum_style=self._selected_style,
+            optimized_spectrum_style=self._optimized_style,
         )
 
     def _effective_mode(self) -> OperationMode | None:
@@ -464,6 +800,7 @@ class MainWindow(QMainWindow):
         save_user_settings(self.user_settings)
         if self.loaded is not None:
             self._rebuild_mode_view_from_settings()
+        self._apply_all_spectrum_styles()
         self._refresh_analysis()
 
     def _on_override_controls_changed(self, _value=None) -> None:
@@ -493,9 +830,16 @@ class MainWindow(QMainWindow):
         if override_mode is not None:
             mode_text = f"{mode_text} (override)"
         self.mode_value.setText(mode_text)
+        self._load_style_controls_from_target()
+        self._apply_loaded_experiment_parameters()
         self._set_default_noise_window_from_mode_view()
+        self._apply_all_spectrum_styles()
+        self._update_plot_tab_availability()
         self._render_heatmap()
+        self._sync_axis_controls_to_current_data("optimized")
         self._select_row(self.current_row)
+        self._sync_axis_controls_to_current_data("selected")
+        self._activate_preferred_plot_tab()
 
     def _on_load_h5(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(self, "Open IMS H5", str(Path.home()), "H5 Files (*.h5 *.hdf5)")
@@ -515,9 +859,16 @@ class MainWindow(QMainWindow):
         self.mode_value.setText(self.loaded.mode_label)
         self.created_value.setText(self.loaded.created_at or "-")
         self.current_row = 0
+        self._load_style_controls_from_target()
+        self._apply_loaded_experiment_parameters()
         self._set_default_noise_window_from_mode_view()
+        self._apply_all_spectrum_styles()
+        self._update_plot_tab_availability()
         self._render_heatmap()
+        self._sync_axis_controls_to_current_data("optimized")
         self._select_row(0)
+        self._sync_axis_controls_to_current_data("selected")
+        self._activate_preferred_plot_tab()
 
     def _set_default_noise_window_from_mode_view(self) -> None:
         if self.mode_view is None or self.mode_view.x_axis.size == 0:
@@ -540,12 +891,22 @@ class MainWindow(QMainWindow):
 
         x = self.mode_view.x_axis
         y = self.mode_view.y_axis
-        z = self.mode_view.heatmap
+        z = self._display_heatmap_matrix()
         if z.size == 0:
             self.heat_image.setImage(np.empty((0, 0)))
             return
 
-        self.heat_image.setImage(z, autoLevels=True)
+        if self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
+            x = self.mode_view.voltage_axis_kv
+            y = self.mode_view.x_axis
+            z = z.T
+            self.heat_plot.setLabel("bottom", "Stepped Voltage (kV)")
+            self.heat_plot.setLabel("left", "Drift Time (ms)")
+            self.heat_image.setImage(z, autoLevels=True, axisOrder="row-major")
+        else:
+            self.heat_plot.setLabel("bottom", self.mode_view.x_label)
+            self.heat_plot.setLabel("left", self.mode_view.y_label)
+            self.heat_image.setImage(z, autoLevels=True)
 
         x_min = float(np.min(x))
         x_max = float(np.max(x))
@@ -553,9 +914,7 @@ class MainWindow(QMainWindow):
         y_max = float(np.max(y))
         rect = QtCore.QRectF(x_min, y_min, max(1e-9, x_max - x_min), max(1e-9, y_max - y_min))
         self.heat_image.setRect(rect)
-
-        self.heat_plot.setLabel("bottom", self.mode_view.x_label)
-        self.heat_plot.setLabel("left", self.mode_view.y_label)
+        self._update_heatmap_cursor()
         self._update_vsims_overlay_and_trace()
 
     def _nearest_axis_index(self, axis: np.ndarray, value: float) -> int:
@@ -567,7 +926,10 @@ class MainWindow(QMainWindow):
         if self.mode_view is None or self.mode_view.heatmap.size == 0:
             return
         pos = self.heat_plot.getViewBox().mapSceneToView(event.scenePos())
-        row = self._nearest_axis_index(self.mode_view.y_axis, float(pos.y()))
+        if self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
+            row = self._nearest_axis_index(self.mode_view.voltage_axis_kv, float(pos.x()))
+        else:
+            row = self._nearest_axis_index(self.mode_view.y_axis, float(pos.y()))
         self._select_row(row)
 
     def _on_spectrum_click(self, event) -> None:
@@ -578,23 +940,98 @@ class MainWindow(QMainWindow):
         self.cursor_line.setPos(self.cursor_x)
         self._refresh_analysis()
 
+    def _on_optimized_spectrum_click(self, event) -> None:
+        if self.mode_view is None or self.mode_view.heatmap.size == 0:
+            return
+        pos = self.optimized_plot.getViewBox().mapSceneToView(event.scenePos())
+        self.optimized_cursor_x = float(pos.x())
+        self.optimized_cursor_line.setPos(self.optimized_cursor_x)
+        self._refresh_analysis()
+
+    def _on_baseline_subtraction_toggled(self, _checked: bool) -> None:
+        if self.mode_view is None:
+            return
+        self._render_heatmap()
+        self._select_row(self.current_row)
+
+    def _is_fft_mode(self) -> bool:
+        if self.mode_view is None:
+            return False
+        return self.mode_view.mode in {OperationMode.FTIMS, OperationMode.SWEPT_FTIMS}
+
+    def _baseline_bounds(self) -> tuple[float, float]:
+        low = float(self.noise_start_spin.value())
+        high = float(self.noise_end_spin.value())
+        return (low, high) if low <= high else (high, low)
+
+    def _subtract_baseline_row(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        low, high = self._baseline_bounds()
+        if x.size == 0 or y.size == 0:
+            return np.asarray(y, dtype=np.float64).copy()
+        baseline_mask = (x >= low) & (x <= high)
+        y_arr = np.asarray(y, dtype=np.float64)
+        if not np.any(baseline_mask):
+            return y_arr.copy()
+        baseline_mean = float(np.mean(y_arr[baseline_mask]))
+        return y_arr - baseline_mean
+
+    def _display_heatmap_matrix(self) -> np.ndarray:
+        if self.mode_view is None:
+            return np.empty((0, 0), dtype=np.float64)
+
+        matrix = np.asarray(self.mode_view.heatmap, dtype=np.float64)
+        if matrix.size == 0:
+            return matrix
+
+        # Remove FFT-only polarity inversion effects for stepped/swept FTIMS.
+        if self._is_fft_mode():
+            matrix = np.abs(matrix)
+
+        if not self.subtract_baseline_checkbox.isChecked():
+            return matrix
+
+        x = np.asarray(self.mode_view.x_axis, dtype=np.float64)
+        if matrix.ndim != 2:
+            return matrix
+
+        rows = [self._subtract_baseline_row(x, matrix[row_idx, :]) for row_idx in range(matrix.shape[0])]
+        return np.asarray(rows, dtype=np.float64)
+
+    def _display_row(self, row: int) -> np.ndarray:
+        matrix = self._display_heatmap_matrix()
+        if matrix.ndim != 2 or matrix.shape[0] == 0:
+            return np.asarray([], dtype=np.float64)
+        row_idx = int(np.clip(row, 0, matrix.shape[0] - 1))
+        return matrix[row_idx, :]
+
+    def _display_row_count(self) -> int:
+        if self.mode_view is None:
+            return 0
+        if self.mode_view.heatmap.ndim == 2:
+            return int(self.mode_view.heatmap.shape[0])
+        return 0
+
     def _select_row(self, row: int) -> None:
         if self.mode_view is None or self.mode_view.heatmap.size == 0:
             return
 
-        row = int(np.clip(row, 0, self.mode_view.heatmap.shape[0] - 1))
+        display_rows = self._display_row_count()
+        if display_rows <= 0:
+            return
+        row = int(np.clip(row, 0, display_rows - 1))
         self.current_row = row
         x = self.mode_view.x_axis
-        y = self.mode_view.heatmap[row, :]
+        y = self._display_row(row)
 
         self.spectrum_curve.setData(x, y)
         self.spectrum_plot.setLabel("bottom", self.mode_view.x_label)
-        self._apply_spectrum_style()
+        self._apply_all_spectrum_styles()
 
         if x.size:
             if self.cursor_x < float(np.min(x)) or self.cursor_x > float(np.max(x)):
                 self.cursor_x = float(x[len(x) // 2])
             self.cursor_line.setPos(self.cursor_x)
+        self._update_heatmap_cursor()
 
         voltage_kv = self._metadata_voltage_kv_for_row(row)
         self.metadata_voltage_value.setText("-" if voltage_kv is None else f"{voltage_kv:.4f}")
@@ -607,8 +1044,8 @@ class MainWindow(QMainWindow):
         cfg = self.loaded.config
         mode = cfg.operation_mode
 
-        if mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
-            if row < self.mode_view.voltage_axis_kv.size:
+        if mode == OperationMode.STEPPED_VSIMS:
+            if self.mode_view.voltage_axis_kv is not None and row < self.mode_view.voltage_axis_kv.size:
                 return float(self.mode_view.voltage_axis_kv[row])
 
         if mode == OperationMode.SWEPT_VSIMS:
@@ -623,10 +1060,13 @@ class MainWindow(QMainWindow):
         if self.mode_view is None or self.mode_view.heatmap.size == 0:
             self.noise_markers.setData([], [])
             self.peak_markers.setData([], [])
+            self.optimized_peak_markers.setData([], [])
+            self.peak_table.setRowCount(0)
+            self.optimized_peak_table.setRowCount(0)
             return
 
         x = self.mode_view.x_axis
-        y = self.mode_view.heatmap[self.current_row, :]
+        y = self._display_row(self.current_row)
         metadata_voltage_kv = self._metadata_voltage_kv_for_row(self.current_row)
         analysis_voltage_kv = self._effective_voltage_kv(metadata_voltage_kv)
         self.metadata_voltage_value.setText("-" if analysis_voltage_kv is None else f"{analysis_voltage_kv:.4f}")
@@ -690,6 +1130,9 @@ class MainWindow(QMainWindow):
         self.noise_markers.setData(x[mask], y[mask])
 
     def _populate_peak_table(self, peaks) -> None:
+        self.peak_table.setHorizontalHeaderLabels(
+            ["Peak", "Position", "Intensity", "SNR", "Ko", "FWHM", "Resolving Power"]
+        )
         self.peak_table.setRowCount(len(peaks))
         for row, peak in enumerate(peaks):
             cells = [
@@ -711,17 +1154,19 @@ class MainWindow(QMainWindow):
         if self.loaded.config.operation_mode != OperationMode.STEPPED_VSIMS:
             self.heat_overlay_curve.setData([], [])
             self.optimized_curve.setData([], [])
-            self.optimized_plot.hide()
+            self.optimized_peak_markers.setData([], [])
+            self.optimized_peak_table.setRowCount(0)
             return
 
         if self.mode_view.voltage_axis_kv is None or self.mode_view.voltage_axis_kv.size == 0:
             self.heat_overlay_curve.setData([], [])
             self.optimized_curve.setData([], [])
-            self.optimized_plot.hide()
+            self.optimized_peak_markers.setData([], [])
+            self.optimized_peak_table.setRowCount(0)
             return
 
         voltage_axis, topt_values, optimized_trace = extract_optimized_trace(
-            heatmap=self.mode_view.heatmap,
+            heatmap=self._display_heatmap_matrix(),
             x_time_ms=self.mode_view.x_axis,
             y_voltage_kv=self.mode_view.voltage_axis_kv,
             pulse_width_ms=self.loaded.config.pulse_width_ms,
@@ -729,9 +1174,90 @@ class MainWindow(QMainWindow):
             gate_multiplier=float(self.gate_mult_spin.value()),
             time_add_ms=float(self.time_add_spin.value()),
         )
-        self.heat_overlay_curve.setData(topt_values, voltage_axis)
-        self.optimized_curve.setData(voltage_axis, optimized_trace)
+        self.heat_overlay_curve.setData(voltage_axis, topt_values)
+        self.optimized_curve.setData(topt_values, optimized_trace)
+        if topt_values.size:
+            if self.optimized_cursor_x < float(np.min(topt_values)) or self.optimized_cursor_x > float(np.max(topt_values)):
+                self.optimized_cursor_x = float(topt_values[len(topt_values) // 2])
+            self.optimized_cursor_line.setPos(self.optimized_cursor_x)
+        self._update_vsims_optimized_peaks(topt_values, optimized_trace, voltage_axis)
+        self._update_heatmap_cursor()
         self.optimized_plot.show()
+
+    def _update_vsims_optimized_peaks(self, optimized_x: np.ndarray, optimized_y: np.ndarray, voltage_axis: np.ndarray) -> None:
+        if optimized_x.size == 0 or optimized_y.size == 0 or voltage_axis.size == 0:
+            self.optimized_peak_markers.setData([], [])
+            self.peak_table.setRowCount(0)
+            return
+
+        if self.peak_mode_combo.currentText() == "All peaks":
+            peaks = detect_all_peaks(
+                x=optimized_x,
+                y=optimized_y,
+                noise_start=float(self.noise_start_spin.value()),
+                noise_end=float(self.noise_end_spin.value()),
+                min_prominence=float(self.min_prom_spin.value()),
+                min_snr=float(self.min_snr_spin.value()),
+                pressure_torr=float(self.pressure_spin.value()),
+                temperature_c=float(self.temperature_spin.value()),
+                length_cm=float(self.length_spin.value()),
+                voltage_kv=0.0,
+                gate_multiplier=float(self.gate_mult_spin.value()),
+            )
+        else:
+            peaks = detect_nearest_peak(
+                x=optimized_x,
+                y=optimized_y,
+                cursor_x=self.optimized_cursor_x,
+                noise_start=float(self.noise_start_spin.value()),
+                noise_end=float(self.noise_end_spin.value()),
+                pressure_torr=float(self.pressure_spin.value()),
+                temperature_c=float(self.temperature_spin.value()),
+                length_cm=float(self.length_spin.value()),
+                voltage_kv=0.0,
+                gate_multiplier=float(self.gate_mult_spin.value()),
+            )
+
+        if not peaks:
+            self.optimized_peak_markers.setData([], [])
+            self.optimized_peak_table.setRowCount(0)
+            return
+
+        marker_x = [peak.x_position for peak in peaks]
+        marker_y = [peak.intensity for peak in peaks]
+        self.optimized_peak_markers.setData(marker_x, marker_y)
+
+        rows = []
+        for peak in peaks:
+            nearest_idx = int(np.argmin(np.abs(optimized_x - peak.x_position)))
+            voltage_kv = float(voltage_axis[nearest_idx])
+            ko = compute_ko(
+                drift_time_ms=float(peak.x_position),
+                pressure_torr=float(self.pressure_spin.value()),
+                temperature_c=float(self.temperature_spin.value()),
+                length_cm=float(self.length_spin.value()),
+                voltage_kv=voltage_kv,
+                gate_multiplier=float(self.gate_mult_spin.value()),
+            )
+            rows.append(
+                [
+                    f"{peak.x_position:.5f}",
+                    f"{voltage_kv:.4f}",
+                    f"{peak.intensity:.5f}",
+                    f"{peak.snr_linear:.2f} ({peak.snr_db:.2f} dB)",
+                    "--" if ko is None else f"{ko:.5f}",
+                    f"{peak.fwhm:.5f}",
+                    f"{peak.resolving_power:.5f}",
+                ]
+            )
+
+        self.optimized_peak_table.setHorizontalHeaderLabels(
+            ["Optimized t (ms)", "Voltage (kV)", "Intensity", "SNR", "Ko", "FWHM", "Resolving Power"]
+        )
+        self.optimized_peak_table.setRowCount(len(rows))
+        for row_index, row_values in enumerate(rows):
+            for col_index, value in enumerate(row_values):
+                self.optimized_peak_table.setItem(row_index, col_index, QTableWidgetItem(value))
 
     def _export_plot_svg(self, plot_widget: pg.PlotWidget, caption: str, hide_cursor: bool = False) -> None:
         out_path, _ = QFileDialog.getSaveFileName(self, caption, str(Path.home() / "figure.svg"), "SVG Files (*.svg)")
@@ -742,23 +1268,29 @@ class MainWindow(QMainWindow):
         if path.suffix.lower() != ".svg":
             path = path.with_suffix(".svg")
 
-        cursor_visible = self.cursor_line.isVisible()
+        cursor_item = self.cursor_line if plot_widget is self.spectrum_plot else self.optimized_cursor_line
+        cursor_visible = cursor_item.isVisible()
         if hide_cursor:
-            self.cursor_line.setVisible(False)
+            cursor_item.setVisible(False)
         try:
             exporter = SVGExporter(plot_widget.plotItem)
             exporter.export(str(path))
         finally:
             if hide_cursor:
-                self.cursor_line.setVisible(cursor_visible)
+                cursor_item.setVisible(cursor_visible)
 
     def _export_spectrum_svg(self) -> None:
+        target = self._active_style_target()
+        if target is None:
+            QMessageBox.warning(self, "Export Error", "Open a spectrum tab before exporting SVG.")
+            return
         baseline_visible = self.noise_markers.isVisible()
         peaks_visible = self.peak_markers.isVisible()
         self.noise_markers.setVisible(False)
         self.peak_markers.setVisible(peaks_visible and self.export_peak_highlights_checkbox.isChecked())
         try:
-            self._export_plot_svg(self.spectrum_plot, "Export Spectrum SVG", hide_cursor=True)
+            plot_widget = self.spectrum_plot if target == "selected" else self.optimized_plot
+            self._export_plot_svg(plot_widget, "Export Spectrum SVG", hide_cursor=True)
         finally:
             self.noise_markers.setVisible(baseline_visible)
             self.peak_markers.setVisible(peaks_visible)
@@ -766,6 +1298,11 @@ class MainWindow(QMainWindow):
     def _export_spectrum_csv(self) -> None:
         if self.mode_view is None or self.mode_view.heatmap.size == 0:
             QMessageBox.warning(self, "Export Error", "No spectrum is currently available for CSV export.")
+            return
+
+        target = self._active_style_target()
+        if target is None:
+            QMessageBox.warning(self, "Export Error", "Open a spectrum tab before exporting CSV.")
             return
 
         out_path, _ = QFileDialog.getSaveFileName(
@@ -781,14 +1318,28 @@ class MainWindow(QMainWindow):
         if path.suffix.lower() != ".csv":
             path = path.with_suffix(".csv")
 
-        x = np.asarray(self.mode_view.x_axis, dtype=np.float64)
-        y = np.asarray(self.mode_view.heatmap[self.current_row, :], dtype=np.float64)
+        if target == "optimized" and self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
+            voltage_axis, topt_values, optimized_trace = extract_optimized_trace(
+                heatmap=self._display_heatmap_matrix(),
+                x_time_ms=self.mode_view.x_axis,
+                y_voltage_kv=self.mode_view.voltage_axis_kv,
+                pulse_width_ms=self.loaded.config.pulse_width_ms,
+                temperature_c=float(self.temperature_spin.value()),
+                gate_multiplier=float(self.gate_mult_spin.value()),
+                time_add_ms=float(self.time_add_spin.value()),
+            )
+            x = np.asarray(topt_values, dtype=np.float64)
+            y = np.asarray(optimized_trace, dtype=np.float64)
+        else:
+            x = np.asarray(self.mode_view.x_axis, dtype=np.float64)
+            y = np.asarray(self._display_row(self.current_row), dtype=np.float64)
         data = np.column_stack((x, y))
-        x_label = self.mode_view.x_label.replace(",", " ")
+        x_label = ("Optimized Drift Time (ms)" if target == "optimized" else self.mode_view.x_label).replace(",", " ")
         np.savetxt(path, data, delimiter=",", header=f"{x_label},Signal", comments="")
 
     def _export_table_csv(self) -> None:
-        if self.peak_table.rowCount() == 0:
+        table = self._active_peak_table()
+        if table.rowCount() == 0:
             QMessageBox.warning(self, "Export Error", "Peak table is empty. Run peak detection first.")
             return
 
@@ -806,17 +1357,17 @@ class MainWindow(QMainWindow):
             path = path.with_suffix(".csv")
 
         headers: list[str] = []
-        for col in range(self.peak_table.columnCount()):
-            header_item = self.peak_table.horizontalHeaderItem(col)
+        for col in range(table.columnCount()):
+            header_item = table.horizontalHeaderItem(col)
             headers.append(header_item.text() if header_item is not None else f"Column {col + 1}")
 
         with path.open("w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
             writer.writerow(headers)
-            for row in range(self.peak_table.rowCount()):
+            for row in range(table.rowCount()):
                 row_values: list[str] = []
-                for col in range(self.peak_table.columnCount()):
-                    item = self.peak_table.item(row, col)
+                for col in range(table.columnCount()):
+                    item = table.item(row, col)
                     row_values.append(item.text() if item is not None else "")
                 writer.writerow(row_values)
 
