@@ -75,9 +75,47 @@ def load_h5_experiment(file_path: str) -> LoadedExperiment:
     else:
         matrix = np.vstack(datasets)
 
+    # Load FTIMS stepped raw spectra (optional group)
+    ftims_raw_spectrum_iterations: list[dict[float, float]] = []
+    with h5py.File(source, "r") as handle:
+        raw_group = handle.get("ftims_raw_spectra")
+        if isinstance(raw_group, h5py.Group):
+            for key in sorted(raw_group.keys(), key=lambda x: int(x.split("_")[-1])):
+                ds = raw_group[key]
+                rows = np.asarray(ds[:], dtype=np.float64)
+                raw_points: dict[float, float] = {}
+                if rows.ndim == 2 and rows.shape[1] == 2:
+                    for row in rows:
+                        raw_points[float(row[0])] = float(row[1])
+                ftims_raw_spectrum_iterations.append(raw_points)
+
+        # Load swept FTIMS raw time-domain and FFT bin data (optional groups)
+        swept_raw_time_domain_iterations: list[np.ndarray] = []
+        swept_fft_frequency_bins_iterations: list[np.ndarray] = []
+        swept_raw_group = handle.get("swept_raw_iterations")
+        swept_bins_group = handle.get("swept_fft_bins_hz")
+        if isinstance(swept_raw_group, h5py.Group) or isinstance(swept_bins_group, h5py.Group):
+            keys: set[str] = set()
+            if isinstance(swept_raw_group, h5py.Group):
+                keys.update(swept_raw_group.keys())
+            if isinstance(swept_bins_group, h5py.Group):
+                keys.update(swept_bins_group.keys())
+            for key in sorted(keys, key=lambda x: int(x.split("_")[-1])):
+                raw_arr = np.empty((0,), dtype=np.float64)
+                bins_arr = np.empty((0,), dtype=np.float64)
+                if isinstance(swept_raw_group, h5py.Group) and key in swept_raw_group:
+                    raw_arr = np.asarray(swept_raw_group[key][:], dtype=np.float64)
+                if isinstance(swept_bins_group, h5py.Group) and key in swept_bins_group:
+                    bins_arr = np.asarray(swept_bins_group[key][:], dtype=np.float64)
+                swept_raw_time_domain_iterations.append(raw_arr)
+                swept_fft_frequency_bins_iterations.append(bins_arr)
+
     return LoadedExperiment(
         config=config,
         matrix=matrix,
         created_at=created_at,
         iteration_timestamps=timestamps,
+        ftims_raw_spectrum_iterations=ftims_raw_spectrum_iterations,
+        swept_raw_time_domain_iterations=swept_raw_time_domain_iterations,
+        swept_fft_frequency_bins_iterations=swept_fft_frequency_bins_iterations,
     )
