@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ims_data_analysis.analysis.metrics import compute_ko, detect_all_peaks, detect_nearest_peak
-from ims_data_analysis.analysis.mode_transform import build_mode_view
+from ims_data_analysis.analysis.mode_transform import build_heatmap_display, build_mode_view
 from ims_data_analysis.analysis.vsims_optimizer import extract_optimized_trace
 from ims_data_analysis.io.h5_loader import H5LoadError, load_h5_experiment
 from ims_data_analysis.io.user_settings import SpectrumStyleSettings, UserSettings, load_user_settings, save_user_settings
@@ -569,12 +569,7 @@ class MainWindow(QMainWindow):
         if target == "heat":
             if self.mode_view is None:
                 return np.array([]), np.array([])
-            # For heatmap: X axis is iterations (or voltage for STEPPED_VSIMS), Y axis is drift time
-            if self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
-                x_data = self.mode_view.voltage_axis_kv  # voltage (X-axis)
-            else:
-                x_data = self.mode_view.x_axis  # iterations (X-axis)
-            y_data = self.mode_view.y_axis  # drift time (Y-axis)
+            x_data, y_data, _, _, _ = build_heatmap_display(self.mode_view)
         elif target == "optimized":
             x_data, y_data = self.optimized_curve.getData()
         else:
@@ -926,23 +921,16 @@ class MainWindow(QMainWindow):
         if self.mode_view is None:
             return
 
-        x = self.mode_view.x_axis
-        y = self.mode_view.y_axis
-        z = self._display_heatmap_matrix()
+        x, y, z, x_label, y_label = build_heatmap_display(self.mode_view)
         if z.size == 0:
             self.heat_image.setImage(np.empty((0, 0)))
             return
 
-        if self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
-            x = self.mode_view.voltage_axis_kv
-            y = self.mode_view.x_axis
-            z = z.T
-            self.heat_plot.setLabel("bottom", "Stepped Voltage (kV)")
-            self.heat_plot.setLabel("left", "Drift Time (ms)")
+        self.heat_plot.setLabel("bottom", x_label)
+        self.heat_plot.setLabel("left", y_label)
+        if z.shape == self.mode_view.heatmap.T.shape:
             self.heat_image.setImage(z, autoLevels=True, axisOrder="row-major")
         else:
-            self.heat_plot.setLabel("bottom", self.mode_view.x_label)
-            self.heat_plot.setLabel("left", self.mode_view.y_label)
             self.heat_image.setImage(z, autoLevels=True)
 
         x_min = float(np.min(x))
@@ -967,7 +955,10 @@ class MainWindow(QMainWindow):
         if self.mode_view is None or self.mode_view.heatmap.size == 0:
             return
         pos = self.heat_plot.getViewBox().mapSceneToView(event.scenePos())
-        if self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
+        if self.mode_view.mode == OperationMode.DTIMS:
+            row_axis = np.arange(1, self.mode_view.heatmap.shape[0] + 1, dtype=np.float64)
+            row = self._nearest_axis_index(row_axis, float(pos.x()))
+        elif self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
             row = self._nearest_axis_index(self.mode_view.voltage_axis_kv, float(pos.x()))
         else:
             row = self._nearest_axis_index(self.mode_view.y_axis, float(pos.y()))

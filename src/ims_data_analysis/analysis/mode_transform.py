@@ -81,3 +81,21 @@ def build_mode_view(experiment: LoadedExperiment, mode_override: OperationMode |
         x_label="Drift Time (ms)",
         y_label="Iteration",
     )
+
+
+def build_heatmap_display(view: ModeView) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, str]:
+    matrix = np.asarray(view.heatmap, dtype=np.float64)
+    if matrix.size == 0:
+        return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64), matrix, view.x_label, view.y_label
+
+    if view.mode == OperationMode.DTIMS:
+        x_axis = np.arange(1, matrix.shape[0] + 1, dtype=np.float64)
+        y_axis = np.asarray(view.x_axis, dtype=np.float64)
+        return x_axis, y_axis, matrix.T, "Iteration", "Drift Time (ms)"
+
+    if view.mode == OperationMode.STEPPED_VSIMS and view.voltage_axis_kv is not None:
+        x_axis = np.asarray(view.voltage_axis_kv, dtype=np.float64)
+        y_axis = np.asarray(view.x_axis, dtype=np.float64)
+        return x_axis, y_axis, matrix.T, "Stepped Voltage (kV)", "Drift Time (ms)"
+
+    return np.asarray(view.x_axis, dtype=np.float64), np.asarray(view.y_axis, dtype=np.float64), matrix, view.x_label, view.y_label
