@@ -111,6 +111,7 @@ class MainWindow(QMainWindow):
         self.peak_mode_combo = QComboBox()
         self.peak_mode_combo.addItems(["All peaks", "Nearest to cursor"])
         self.subtract_baseline_checkbox = QCheckBox("Subtract baseline")
+        self.invert_signal_checkbox = QCheckBox("Invert signal (correct polarity)")
 
         param_form.addRow("Pressure P (Torr):", self.pressure_spin)
         param_form.addRow("Temperature T (C):", self.temperature_spin)
@@ -123,6 +124,7 @@ class MainWindow(QMainWindow):
         param_form.addRow("Min SNR:", self.min_snr_spin)
         param_form.addRow("Peak Detection:", self.peak_mode_combo)
         param_form.addRow(self.subtract_baseline_checkbox)
+        param_form.addRow(self.invert_signal_checkbox)
         control_layout.addWidget(param_group)
 
         metadata_group = QGroupBox("Metadata Overrides")
@@ -220,9 +222,15 @@ class MainWindow(QMainWindow):
         left_control_panel.setMinimumWidth(340)
 
         self.heatmap_panel = QWidget()
-        heatmap_layout = QHBoxLayout(self.heatmap_panel)
+        heatmap_layout = QVBoxLayout(self.heatmap_panel)
         heatmap_layout.setContentsMargins(0, 0, 0, 0)
         heatmap_layout.setSpacing(6)
+
+        # Heatmap visualization (plot + LUT)
+        heat_viz_widget = QWidget()
+        heat_viz_layout = QHBoxLayout(heat_viz_widget)
+        heat_viz_layout.setContentsMargins(0, 0, 0, 0)
+        heat_viz_layout.setSpacing(6)
 
         self.heat_lut = pg.HistogramLUTWidget(orientation="vertical", gradientPosition="right")
         self.heat_lut.setMinimumWidth(90)
@@ -235,8 +243,8 @@ class MainWindow(QMainWindow):
         self.heat_plot.addItem(self.heat_image)
         self.heat_lut.item.setImageItem(self.heat_image)
 
-        heatmap_layout.addWidget(self.heat_plot, stretch=1)
-        heatmap_layout.addWidget(self.heat_lut)
+        heat_viz_layout.addWidget(self.heat_plot, stretch=1)
+        heat_viz_layout.addWidget(self.heat_lut)
 
         self.heat_overlay_curve = pg.PlotDataItem(pen=pg.mkPen(color="#ffd43b", width=2, style=QtCore.Qt.DashLine))
         self.heat_plot.addItem(self.heat_overlay_curve)
@@ -244,6 +252,12 @@ class MainWindow(QMainWindow):
         self.heat_cursor_line.setZValue(10)
         self.heat_plot.addItem(self.heat_cursor_line)
         self.heat_plot.scene().sigMouseClicked.connect(self._on_heat_click)
+
+        # Add heatmap visualization and axis controls to layout
+        heatmap_layout.addWidget(heat_viz_widget, stretch=1)
+        
+        self.heat_axis_controls = self._build_axis_controls("Heatmap Axis Controls", "heat")
+        heatmap_layout.addWidget(self.heat_axis_controls)
 
         self.spectrum_plot = pg.PlotWidget(title="Selected Spectrum")
         self.spectrum_plot.setMouseEnabled(x=False, y=False)
@@ -352,6 +366,7 @@ class MainWindow(QMainWindow):
             widget.valueChanged.connect(self._refresh_analysis)
         self.peak_mode_combo.currentIndexChanged.connect(self._refresh_analysis)
         self.subtract_baseline_checkbox.toggled.connect(self._on_baseline_subtraction_toggled)
+        self.invert_signal_checkbox.toggled.connect(self._on_signal_inversion_toggled)
         self.mode_override_checkbox.toggled.connect(self._on_override_controls_changed)
         self.mode_override_combo.currentIndexChanged.connect(self._on_override_controls_changed)
         self.voltage_override_checkbox.toggled.connect(self._on_override_controls_changed)
@@ -512,7 +527,12 @@ class MainWindow(QMainWindow):
 
     def _apply_axis_ranges(self, target: str) -> None:
         controls = self._axis_controls_for_target(target)
-        plot_widget = self.spectrum_plot if target == "selected" else self.optimized_plot
+        if target == "heat":
+            plot_widget = self.heat_plot
+        elif target == "selected":
+            plot_widget = self.spectrum_plot
+        else:
+            plot_widget = self.optimized_plot
         x_min = min(float(controls["x_min"].value()), float(controls["x_max"].value()))
         x_max = max(float(controls["x_min"].value()), float(controls["x_max"].value()))
         y_min = min(float(controls["y_min"].value()), float(controls["y_max"].value()))
@@ -546,7 +566,16 @@ class MainWindow(QMainWindow):
         self._apply_axis_ranges(target)
 
     def _current_curve_data(self, target: str) -> tuple[np.ndarray, np.ndarray]:
-        if target == "optimized":
+        if target == "heat":
+            if self.mode_view is None:
+                return np.array([]), np.array([])
+            # For heatmap: X axis is iterations (or voltage for STEPPED_VSIMS), Y axis is drift time
+            if self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
+                x_data = self.mode_view.voltage_axis_kv  # voltage (X-axis)
+            else:
+                x_data = self.mode_view.x_axis  # iterations (X-axis)
+            y_data = self.mode_view.y_axis  # drift time (Y-axis)
+        elif target == "optimized":
             x_data, y_data = self.optimized_curve.getData()
         else:
             x_data, y_data = self.spectrum_curve.getData()
@@ -610,8 +639,11 @@ class MainWindow(QMainWindow):
             self.show_title_checkbox.blockSignals(False)
 
     def _update_spectrum_controls_enabled(self) -> None:
-        active_target = self._active_style_target()
-        enabled = active_target is not None
+        spectrum_target = self._active_style_target()
+        spectrum_enabled = spectrum_target is not None
+        heatmap_enabled = self.mode_view is not None
+        
+        # Enable/disable spectrum styling controls based on active spectrum tab
         for widget in [
             self.curve_color_btn,
             self.baseline_color_btn,
@@ -629,7 +661,10 @@ class MainWindow(QMainWindow):
             self.selected_axis_controls,
             self.optimized_axis_controls,
         ]:
-            widget.setEnabled(enabled)
+            widget.setEnabled(spectrum_enabled)
+        
+        # Enable/disable heatmap controls based on data availability
+        self.heat_axis_controls.setEnabled(heatmap_enabled)
 
     def _update_plot_tab_availability(self) -> None:
         is_step_vsims = self.mode_view is not None and self.mode_view.mode == OperationMode.STEPPED_VSIMS
@@ -744,6 +779,7 @@ class MainWindow(QMainWindow):
         self.voltage_override_missing_only_checkbox.setChecked(
             self.user_settings.voltage_override_only_when_missing
         )
+        self.invert_signal_checkbox.setChecked(self.user_settings.signal_inverted)
 
     def _apply_loaded_experiment_parameters(self) -> None:
         if self.loaded is None:
@@ -776,6 +812,7 @@ class MainWindow(QMainWindow):
             voltage_override_kv=float(self.voltage_override_spin.value()),
             voltage_override_only_when_missing=self.voltage_override_missing_only_checkbox.isChecked(),
             vs_step_table_target=self._active_spectrum_target,
+            signal_inverted=self.invert_signal_checkbox.isChecked(),
             selected_spectrum_style=self._selected_style,
             optimized_spectrum_style=self._optimized_style,
         )
@@ -916,6 +953,10 @@ class MainWindow(QMainWindow):
         self.heat_image.setRect(rect)
         self._update_heatmap_cursor()
         self._update_vsims_overlay_and_trace()
+        
+        # Update heatmap axis controls with current data ranges
+        self._update_axis_controls_from_data("heat", x, y)
+        self._apply_axis_ranges("heat")
 
     def _nearest_axis_index(self, axis: np.ndarray, value: float) -> int:
         if axis.size == 0:
@@ -954,6 +995,12 @@ class MainWindow(QMainWindow):
         self._render_heatmap()
         self._select_row(self.current_row)
 
+    def _on_signal_inversion_toggled(self, _checked: bool) -> None:
+        if self.mode_view is None:
+            return
+        self._render_heatmap()
+        self._select_row(self.current_row)
+
     def _is_fft_mode(self) -> bool:
         if self.mode_view is None:
             return False
@@ -986,6 +1033,10 @@ class MainWindow(QMainWindow):
         # Remove FFT-only polarity inversion effects for stepped/swept FTIMS.
         if self._is_fft_mode():
             matrix = np.abs(matrix)
+
+        # Apply signal inversion if user requested it (to correct polarity)
+        if self.invert_signal_checkbox.isChecked():
+            matrix = -matrix
 
         if not self.subtract_baseline_checkbox.isChecked():
             return matrix

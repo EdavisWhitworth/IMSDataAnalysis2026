@@ -50,6 +50,7 @@ class UserSettings:
     voltage_override_kv: float = 0.0
     voltage_override_only_when_missing: bool = True
     vs_step_table_target: str = "selected"
+    signal_inverted: bool = False
     selected_spectrum_style: SpectrumStyleSettings = field(default_factory=SpectrumStyleSettings)
     optimized_spectrum_style: SpectrumStyleSettings = field(default_factory=SpectrumStyleSettings)
 
@@ -62,6 +63,7 @@ class UserSettings:
             voltage_override_kv=float(raw.get("voltage_override_kv", 0.0)),
             voltage_override_only_when_missing=bool(raw.get("voltage_override_only_when_missing", True)),
             vs_step_table_target=str(raw.get("vs_step_table_target", "selected")),
+            signal_inverted=bool(raw.get("signal_inverted", False)),
             selected_spectrum_style=SpectrumStyleSettings.from_dict(raw.get("selected_spectrum_style")),
             optimized_spectrum_style=SpectrumStyleSettings.from_dict(raw.get("optimized_spectrum_style")),
         )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import h5py
@@ -11,6 +12,40 @@ from ims_data_analysis.models import ExperimentConfig, LoadedExperiment
 
 class H5LoadError(RuntimeError):
     pass
+
+
+def _normalize_metadata_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(key).lower())
+
+
+def _coerce_metadata_float(value: object) -> float:
+    if isinstance(value, np.generic):
+        return float(value.item())
+    return float(value)
+
+
+def _find_metadata_value(h5_file: h5py.File, aliases: list[str]) -> float | None:
+    normalized_aliases = {_normalize_metadata_key(alias) for alias in aliases}
+
+    def scan_group(group: h5py.Group) -> float | None:
+        for key, value in group.attrs.items():
+            if _normalize_metadata_key(key) in normalized_aliases:
+                return _coerce_metadata_float(value)
+        for item in group.values():
+            if isinstance(item, h5py.Group):
+                found = scan_group(item)
+                if found is not None:
+                    return found
+        return None
+
+    preferred_groups = [h5_file.get("user_params"), h5_file.get("config")]
+    for group in preferred_groups:
+        if isinstance(group, h5py.Group):
+            found = scan_group(group)
+            if found is not None:
+                return found
+
+    return scan_group(h5_file)
 
 
 def _parse_config(config_group: h5py.Group, h5_file: h5py.File | None = None) -> ExperimentConfig:
@@ -28,18 +63,25 @@ def _parse_config(config_group: h5py.Group, h5_file: h5py.File | None = None) ->
             else:
                 config_dict[key] = value
 
-    # If user_params group exists, merge those values into the config dict
-    # (IMSControl2026 stores metadata there)
+    # If metadata exists anywhere in the file, merge those values into the config dict.
+    # Metadata should take precedence over config_json defaults.
     if h5_file is not None:
-        user_params_group = h5_file.get("user_params")
-        if isinstance(user_params_group, h5py.Group):
-            for key in ["pressure_torr", "temperature_c", "length_cm", "gate_multiplier"]:
-                if key in user_params_group.attrs:
-                    value = user_params_group.attrs[key]
-                    if isinstance(value, np.generic):
-                        config_dict[key] = float(value.item())
-                    else:
-                        config_dict[key] = float(value)
+        field_mappings = {
+            "pressure_torr": ["pressure_torr", "pressure"],
+            "temperature_c": ["temperature_c", "temperature"],
+            "length_cm": ["length_cm", "drift_length_cm", "drift_length"],
+            "gate_multiplier": [
+                "gate_v_multiplier",
+                "gate_multiplier",
+                "gate_mult",
+                "gate_voltage_multiplier",
+                "gate voltage multiplier",
+            ],
+        }
+        for field_name, possible_keys in field_mappings.items():
+            found_value = _find_metadata_value(h5_file, possible_keys)
+            if found_value is not None:
+                config_dict[field_name] = found_value
 
     return ExperimentConfig.from_dict(config_dict)
 
