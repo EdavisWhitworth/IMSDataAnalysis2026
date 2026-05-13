@@ -750,13 +750,21 @@ class MainWindow(QMainWindow):
             self.noise_markers.setBrush(pg.mkBrush(self._color_with_alpha(style.baseline_color, 170)))
 
     def _update_heatmap_cursor(self) -> None:
-        if self.mode_view is None or self.mode_view.mode != OperationMode.STEPPED_VSIMS or self.mode_view.voltage_axis_kv is None:
+        if self.mode_view is None or self.mode_view.heatmap.size == 0:
+            self.heat_cursor_line.setVisible(False)
+            return
+
+        if self.mode_view.mode == OperationMode.DTIMS:
+            x_axis = np.arange(1, self.mode_view.heatmap.shape[0] + 1, dtype=np.float64)
+        elif self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
+            x_axis = np.asarray(self.mode_view.voltage_axis_kv, dtype=np.float64)
+        else:
             self.heat_cursor_line.setVisible(False)
             return
 
         self.heat_cursor_line.setVisible(True)
-        row = int(np.clip(self.current_row, 0, self.mode_view.voltage_axis_kv.size - 1))
-        self.heat_cursor_line.setPos(float(self.mode_view.voltage_axis_kv[row]))
+        row = int(np.clip(self.current_row, 0, x_axis.size - 1))
+        self.heat_cursor_line.setPos(float(x_axis[row]))
 
     def _activate_preferred_plot_tab(self) -> None:
         if self.mode_view is not None and self.mode_view.mode == OperationMode.STEPPED_VSIMS and self._active_spectrum_target == "optimized":
