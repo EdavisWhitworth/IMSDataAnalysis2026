@@ -921,10 +921,16 @@ class MainWindow(QMainWindow):
         if self.mode_view is None:
             return
 
-        x, y, z, x_label, y_label = build_heatmap_display(self.mode_view)
+        x, y, _, x_label, y_label = build_heatmap_display(self.mode_view)
+        z = self._display_heatmap_matrix()
         if z.size == 0:
             self.heat_image.setImage(np.empty((0, 0)))
             return
+
+        if self.mode_view.mode == OperationMode.DTIMS or (
+            self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None
+        ):
+            z = z.T
 
         self.heat_plot.setLabel("bottom", x_label)
         self.heat_plot.setLabel("left", y_label)
