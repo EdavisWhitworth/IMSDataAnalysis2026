@@ -176,7 +176,6 @@ class ExperimentConfig:
     temperature_c: float | None = None
     length_cm: float | None = None
     gate_multiplier: float | None = None
-    ims_voltage_kv: float | None = None
     ftims_config: FTIMSConfig = field(default_factory=FTIMSConfig)
     swept_ftims_config: SweptFTIMSConfig = field(default_factory=SweptFTIMSConfig)
     vsims_config: SteppedVSIMSConfig = field(default_factory=SteppedVSIMSConfig)
@@ -223,7 +222,6 @@ class ExperimentConfig:
         temperature_value = _first_value("temperature_c", "temperature")
         length_value = _first_value("length_cm", "drift_length_cm", "drift_length")
         gate_multiplier_value = _first_value("gate_multiplier", "gate_mult", "gate_voltage_multiplier")
-        ims_voltage_value = _first_value("ims_voltage_kv", "voltage_kv", "ims_voltage")
 
         return cls(
             operation_mode=mode,
@@ -237,7 +235,6 @@ class ExperimentConfig:
             temperature_c=(None if temperature_value is None else float(temperature_value)),
             length_cm=(None if length_value is None else float(length_value)),
             gate_multiplier=(None if gate_multiplier_value is None else float(gate_multiplier_value)),
-            ims_voltage_kv=(None if ims_voltage_value is None else float(ims_voltage_value)),
             ftims_config=ftims_config,
             swept_ftims_config=swept_ftims_config,
             vsims_config=vsims_config,

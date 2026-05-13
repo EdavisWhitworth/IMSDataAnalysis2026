@@ -104,7 +104,6 @@ class MainWindow(QMainWindow):
         self.temperature_spin = self._spin(-20.0, 200.0, 25.0, 0.1)
         self.length_spin = self._spin(0.1, 200.0, 10.0, 0.1)
         self.gate_mult_spin = self._spin(0.001, 100.0, 1.0, 0.01)
-        self.voltage_spin = self._spin(0.0, 100.0, 0.0, 0.01)
         self.time_add_spin = self._spin(-200.0, 200.0, 0.0, 0.1)
 
         self.noise_start_spin = self._spin(0.0, 100000.0, 0.0, 0.1)
@@ -121,7 +120,6 @@ class MainWindow(QMainWindow):
         param_form.addRow("Temperature T (C):", self.temperature_spin)
         param_form.addRow("Drift Length L (cm):", self.length_spin)
         param_form.addRow("Gate Multiplier:", self.gate_mult_spin)
-        param_form.addRow("IMS Voltage (kV):", self.voltage_spin)
         param_form.addRow("Stepped VSIMS Time Add (ms):", self.time_add_spin)
         param_form.addRow("Noise Start (ms):", self.noise_start_spin)
         param_form.addRow("Noise End (ms):", self.noise_end_spin)
@@ -365,7 +363,6 @@ class MainWindow(QMainWindow):
             self.temperature_spin,
             self.length_spin,
             self.gate_mult_spin,
-            self.voltage_spin,
             self.time_add_spin,
             self.noise_start_spin,
             self.noise_end_spin,
@@ -899,23 +896,6 @@ class MainWindow(QMainWindow):
             finally:
                 widget.blockSignals(False)
 
-        # Populate IMS voltage: prefer explicit ims_voltage_kv metadata, then
-        # fall back to a mode-specific default so the spinbox starts with a
-        # sensible value rather than 0.
-        voltage_default = cfg.ims_voltage_kv
-        if voltage_default is None:
-            mode = cfg.operation_mode
-            if mode == OperationMode.STEPPED_VSIMS:
-                voltage_default = cfg.vsims_config.initial_voltage_kv
-            elif mode == OperationMode.SWEPT_VSIMS:
-                voltage_default = cfg.swept_vsims_config.v_add_kv
-        if voltage_default is not None:
-            self.voltage_spin.blockSignals(True)
-            try:
-                self.voltage_spin.setValue(float(voltage_default))
-            finally:
-                self.voltage_spin.blockSignals(False)
-
         self._refresh_analysis()
 
     def _capture_settings_from_controls(self) -> UserSettings:
@@ -1244,8 +1224,8 @@ class MainWindow(QMainWindow):
 
         x, y = self._selected_spectrum_data()
         metadata_voltage_kv = self._metadata_voltage_kv_for_row(self.current_row)
-        self.metadata_voltage_value.setText("-" if metadata_voltage_kv is None else f"{metadata_voltage_kv:.4f}")
-        analysis_voltage_kv = float(self.voltage_spin.value())
+        analysis_voltage_kv = self._effective_voltage_kv(metadata_voltage_kv)
+        self.metadata_voltage_value.setText("-" if analysis_voltage_kv is None else f"{analysis_voltage_kv:.4f}")
 
         pressure = float(self.pressure_spin.value())
         temperature = float(self.temperature_spin.value())
@@ -1265,7 +1245,7 @@ class MainWindow(QMainWindow):
                 pressure_torr=pressure,
                 temperature_c=temperature,
                 length_cm=length,
-                voltage_kv=analysis_voltage_kv,
+                voltage_kv=0.0 if analysis_voltage_kv is None else analysis_voltage_kv,
                 gate_multiplier=gate_mult,
             )
         else:
@@ -1278,7 +1258,7 @@ class MainWindow(QMainWindow):
                 pressure_torr=pressure,
                 temperature_c=temperature,
                 length_cm=length,
-                voltage_kv=analysis_voltage_kv,
+                voltage_kv=0.0 if analysis_voltage_kv is None else analysis_voltage_kv,
                 gate_multiplier=gate_mult,
             )
 

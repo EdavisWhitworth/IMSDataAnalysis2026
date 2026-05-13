@@ -77,12 +77,6 @@ def _parse_config(config_group: h5py.Group, h5_file: h5py.File | None = None) ->
                 "gate_voltage_multiplier",
                 "gate voltage multiplier",
             ],
-            "ims_voltage_kv": [
-                "ims_voltage_kv",
-                "voltage_kv",
-                "ims_voltage",
-                "drift_voltage_kv",
-            ],
         }
         for field_name, possible_keys in field_mappings.items():
             found_value = _find_metadata_value(h5_file, possible_keys)
