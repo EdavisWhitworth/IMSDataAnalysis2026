@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ims_data_analysis.analysis.metrics import compute_ko, detect_all_peaks, detect_nearest_peak
-from ims_data_analysis.analysis.mode_transform import build_heatmap_display, build_mode_view
+from ims_data_analysis.analysis.mode_transform import average_heatmap_rows, build_heatmap_display, build_mode_view
 from ims_data_analysis.analysis.vsims_optimizer import extract_optimized_trace
 from ims_data_analysis.io.h5_loader import H5LoadError, load_h5_experiment
 from ims_data_analysis.io.user_settings import SpectrumStyleSettings, UserSettings, load_user_settings, save_user_settings
@@ -62,11 +62,10 @@ class MainWindow(QMainWindow):
         self.loaded: LoadedExperiment | None = None
         self.mode_view: ModeView | None = None
         self.current_row: int = 0
+        self.range_end_row: int | None = None
+        self._heat_selection_state: int = 0
         self.cursor_x: float = 0.0
         self.optimized_cursor_x: float = 0.0
-        self._heatmap_primary_row: int | None = None
-        self._heatmap_secondary_row: int | None = None
-        self._selected_spectrum_title_override: str | None = None
         self._active_spectrum_target = "selected"
         self.user_settings: UserSettings = load_user_settings()
         self._selected_style = self.user_settings.selected_spectrum_style
@@ -114,7 +113,6 @@ class MainWindow(QMainWindow):
         self.peak_mode_combo = QComboBox()
         self.peak_mode_combo.addItems(["All peaks", "Nearest to cursor"])
         self.subtract_baseline_checkbox = QCheckBox("Subtract baseline")
-        self.invert_signal_checkbox = QCheckBox("Invert signal (correct polarity)")
 
         param_form.addRow("Pressure P (Torr):", self.pressure_spin)
         param_form.addRow("Temperature T (C):", self.temperature_spin)
@@ -127,7 +125,6 @@ class MainWindow(QMainWindow):
         param_form.addRow("Min SNR:", self.min_snr_spin)
         param_form.addRow("Peak Detection:", self.peak_mode_combo)
         param_form.addRow(self.subtract_baseline_checkbox)
-        param_form.addRow(self.invert_signal_checkbox)
         control_layout.addWidget(param_group)
 
         metadata_group = QGroupBox("Metadata Overrides")
@@ -225,15 +222,9 @@ class MainWindow(QMainWindow):
         left_control_panel.setMinimumWidth(340)
 
         self.heatmap_panel = QWidget()
-        heatmap_layout = QVBoxLayout(self.heatmap_panel)
+        heatmap_layout = QHBoxLayout(self.heatmap_panel)
         heatmap_layout.setContentsMargins(0, 0, 0, 0)
         heatmap_layout.setSpacing(6)
-
-        # Heatmap visualization (plot + LUT)
-        heat_viz_widget = QWidget()
-        heat_viz_layout = QHBoxLayout(heat_viz_widget)
-        heat_viz_layout.setContentsMargins(0, 0, 0, 0)
-        heat_viz_layout.setSpacing(6)
 
         self.heat_lut = pg.HistogramLUTWidget(orientation="vertical", gradientPosition="right")
         self.heat_lut.setMinimumWidth(90)
@@ -246,24 +237,19 @@ class MainWindow(QMainWindow):
         self.heat_plot.addItem(self.heat_image)
         self.heat_lut.item.setImageItem(self.heat_image)
 
-        heat_viz_layout.addWidget(self.heat_plot, stretch=1)
-        heat_viz_layout.addWidget(self.heat_lut)
+        heatmap_layout.addWidget(self.heat_plot, stretch=1)
+        heatmap_layout.addWidget(self.heat_lut)
 
         self.heat_overlay_curve = pg.PlotDataItem(pen=pg.mkPen(color="#ffd43b", width=2, style=QtCore.Qt.DashLine))
         self.heat_plot.addItem(self.heat_overlay_curve)
         self.heat_cursor_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ffffff", width=3))
         self.heat_cursor_line.setZValue(10)
         self.heat_plot.addItem(self.heat_cursor_line)
-        self.heat_cursor_line_secondary = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ffd43b", width=3))
-        self.heat_cursor_line_secondary.setZValue(11)
-        self.heat_plot.addItem(self.heat_cursor_line_secondary)
+        self.heat_range_cursor_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#ffd43b", width=3))
+        self.heat_range_cursor_line.setZValue(9)
+        self.heat_range_cursor_line.setVisible(False)
+        self.heat_plot.addItem(self.heat_range_cursor_line)
         self.heat_plot.scene().sigMouseClicked.connect(self._on_heat_click)
-
-        # Add heatmap visualization and axis controls to layout
-        heatmap_layout.addWidget(heat_viz_widget, stretch=1)
-        
-        self.heat_axis_controls = self._build_axis_controls("Heatmap Axis Controls", "heat")
-        heatmap_layout.addWidget(self.heat_axis_controls)
 
         self.spectrum_plot = pg.PlotWidget(title="Selected Spectrum")
         self.spectrum_plot.setMouseEnabled(x=False, y=False)
@@ -372,7 +358,6 @@ class MainWindow(QMainWindow):
             widget.valueChanged.connect(self._refresh_analysis)
         self.peak_mode_combo.currentIndexChanged.connect(self._refresh_analysis)
         self.subtract_baseline_checkbox.toggled.connect(self._on_baseline_subtraction_toggled)
-        self.invert_signal_checkbox.toggled.connect(self._on_signal_inversion_toggled)
         self.mode_override_checkbox.toggled.connect(self._on_override_controls_changed)
         self.mode_override_combo.currentIndexChanged.connect(self._on_override_controls_changed)
         self.voltage_override_checkbox.toggled.connect(self._on_override_controls_changed)
@@ -525,19 +510,15 @@ class MainWindow(QMainWindow):
         if target == "optimized":
             x_data, y_data = self.optimized_curve.getData()
         else:
-            x_data, y_data = self._selected_spectrum_data()
+            x_data = self.mode_view.x_axis
+            y_data = self._selected_spectrum_values()
         x_arr = np.asarray([] if x_data is None else x_data, dtype=np.float64)
         y_arr = np.asarray([] if y_data is None else y_data, dtype=np.float64)
         self._update_axis_controls_from_data(target, x_arr, y_arr)
 
     def _apply_axis_ranges(self, target: str) -> None:
         controls = self._axis_controls_for_target(target)
-        if target == "heat":
-            plot_widget = self.heat_plot
-        elif target == "selected":
-            plot_widget = self.spectrum_plot
-        else:
-            plot_widget = self.optimized_plot
+        plot_widget = self.spectrum_plot if target == "selected" else self.optimized_plot
         x_min = min(float(controls["x_min"].value()), float(controls["x_max"].value()))
         x_max = max(float(controls["x_min"].value()), float(controls["x_max"].value()))
         y_min = min(float(controls["y_min"].value()), float(controls["y_max"].value()))
@@ -571,11 +552,7 @@ class MainWindow(QMainWindow):
         self._apply_axis_ranges(target)
 
     def _current_curve_data(self, target: str) -> tuple[np.ndarray, np.ndarray]:
-        if target == "heat":
-            if self.mode_view is None:
-                return np.array([]), np.array([])
-            x_data, y_data, _, _, _ = build_heatmap_display(self.mode_view)
-        elif target == "optimized":
+        if target == "optimized":
             x_data, y_data = self.optimized_curve.getData()
         else:
             x_data, y_data = self.spectrum_curve.getData()
@@ -639,11 +616,8 @@ class MainWindow(QMainWindow):
             self.show_title_checkbox.blockSignals(False)
 
     def _update_spectrum_controls_enabled(self) -> None:
-        spectrum_target = self._active_style_target()
-        spectrum_enabled = spectrum_target is not None
-        heatmap_enabled = self.mode_view is not None
-        
-        # Enable/disable spectrum styling controls based on active spectrum tab
+        active_target = self._active_style_target()
+        enabled = active_target is not None
         for widget in [
             self.curve_color_btn,
             self.baseline_color_btn,
@@ -661,10 +635,7 @@ class MainWindow(QMainWindow):
             self.selected_axis_controls,
             self.optimized_axis_controls,
         ]:
-            widget.setEnabled(spectrum_enabled)
-        
-        # Enable/disable heatmap controls based on data availability
-        self.heat_axis_controls.setEnabled(heatmap_enabled)
+            widget.setEnabled(enabled)
 
     def _update_plot_tab_availability(self) -> None:
         is_step_vsims = self.mode_view is not None and self.mode_view.mode == OperationMode.STEPPED_VSIMS
@@ -683,7 +654,7 @@ class MainWindow(QMainWindow):
         self._update_spectrum_controls_enabled()
         self._apply_active_spectrum_style()
 
-    def _apply_style_to_plot(self, plot_widget: pg.PlotWidget, curve_item: pg.PlotDataItem, peak_item: pg.ScatterPlotItem, cursor_item: pg.InfiniteLine | None, style: SpectrumStyleSettings, x_label: str, selected: bool, title_override: str | None = None) -> None:
+    def _apply_style_to_plot(self, plot_widget: pg.PlotWidget, curve_item: pg.PlotDataItem, peak_item: pg.ScatterPlotItem, cursor_item: pg.InfiniteLine | None, style: SpectrumStyleSettings, x_label: str, selected: bool) -> None:
         curve_item.setPen(pg.mkPen(color=style.curve_color, width=2))
         peak_item.setPen(pg.mkPen(color=style.peak_color, width=2))
         if cursor_item is not None:
@@ -696,7 +667,7 @@ class MainWindow(QMainWindow):
         plot_widget.setLabel("bottom", x_label, **text_style)
         plot_widget.setLabel("left", "Signal", **text_style)
         if style.show_title:
-            title_text = title_override or style.title_text or ("Selected Spectrum" if selected else "Optimized Spectrum")
+            title_text = self._display_title_text(style, selected)
             plot_widget.setTitle(
                 (
                     f"<span style='color:{style.text_color};"
@@ -714,6 +685,17 @@ class MainWindow(QMainWindow):
         plot_widget.getAxis("bottom").setStyle(tickFont=font)
         plot_widget.getAxis("left").setStyle(tickFont=font)
 
+    def _display_title_text(self, style: SpectrumStyleSettings, selected: bool) -> str:
+        base_title = style.title_text or ("Selected Spectrum" if selected else "Optimized Spectrum")
+        if not selected or self.range_end_row is None:
+            return base_title
+
+        row_start, row_end = self._selected_row_bounds()
+        if row_start == row_end:
+            return base_title
+        sample_count = (row_end - row_start) + 1
+        return f"{base_title} (Avg Iterations {row_start + 1}-{row_end + 1}, n={sample_count})"
+
     def _apply_all_spectrum_styles(self) -> None:
         self._apply_style_to_plot(
             self.spectrum_plot,
@@ -723,7 +705,6 @@ class MainWindow(QMainWindow):
             self._selected_style,
             self.mode_view.x_label if self.mode_view else "X",
             True,
-            self._selected_spectrum_title_override,
         )
         self.noise_markers.setPen(pg.mkPen(color=self._selected_style.baseline_color, width=1))
         self.noise_markers.setBrush(pg.mkBrush(self._color_with_alpha(self._selected_style.baseline_color, 170)))
@@ -750,113 +731,82 @@ class MainWindow(QMainWindow):
             style,
             self.mode_view.x_label if (target == "selected" and self.mode_view is not None) else "Optimized Drift Time (ms)",
             target == "selected",
-            self._selected_spectrum_title_override if target == "selected" else None,
         )
         if target == "selected":
             self.noise_markers.setPen(pg.mkPen(color=style.baseline_color, width=1))
             self.noise_markers.setBrush(pg.mkBrush(self._color_with_alpha(style.baseline_color, 170)))
 
     def _update_heatmap_cursor(self) -> None:
-        if self.mode_view is None or self.mode_view.heatmap.size == 0:
+        if self.mode_view is None:
             self.heat_cursor_line.setVisible(False)
-            self.heat_cursor_line_secondary.setVisible(False)
+            self.heat_range_cursor_line.setVisible(False)
             return
 
-        if self.mode_view.mode == OperationMode.DTIMS:
-            axis = np.arange(1, self.mode_view.heatmap.shape[0] + 1, dtype=np.float64)
-            angle = 90
-        elif self.mode_view.mode == OperationMode.FTIMS:
-            axis = np.asarray(self.mode_view.y_axis, dtype=np.float64)
-            angle = 0
-        elif self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
-            axis = np.asarray(self.mode_view.voltage_axis_kv, dtype=np.float64)
-            angle = 90
-        else:
-            self.heat_cursor_line.setVisible(False)
-            self.heat_cursor_line_secondary.setVisible(False)
+        if self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
+            self.heat_cursor_line.setVisible(True)
+            self.heat_range_cursor_line.setVisible(False)
+            row = int(np.clip(self.current_row, 0, self.mode_view.voltage_axis_kv.size - 1))
+            self.heat_cursor_line.setPos(float(self.mode_view.voltage_axis_kv[row]))
             return
 
-        if axis.size == 0:
-            self.heat_cursor_line.setVisible(False)
-            self.heat_cursor_line_secondary.setVisible(False)
+        if self.mode_view.mode in {OperationMode.DTIMS, OperationMode.FTIMS}:
+            row_count = self._display_row_count()
+            if row_count <= 0:
+                self.heat_cursor_line.setVisible(False)
+                self.heat_range_cursor_line.setVisible(False)
+                return
+            self.heat_cursor_line.setVisible(True)
+            row = int(np.clip(self.current_row, 0, row_count - 1))
+            self.heat_cursor_line.setPos(float(row + 1))
+            if self.range_end_row is not None:
+                range_row = int(np.clip(self.range_end_row, 0, row_count - 1))
+                self.heat_range_cursor_line.setVisible(True)
+                self.heat_range_cursor_line.setPos(float(range_row + 1))
+            else:
+                self.heat_range_cursor_line.setVisible(False)
             return
 
-        rows = [self._heatmap_primary_row]
-        if self._heatmap_secondary_row is not None:
-            rows.append(self._heatmap_secondary_row)
+        self.heat_cursor_line.setVisible(False)
+        self.heat_range_cursor_line.setVisible(False)
 
-        cursor_lines = [self.heat_cursor_line, self.heat_cursor_line_secondary]
-        for line, row in zip(cursor_lines, rows):
-            row_idx = int(np.clip(row, 0, axis.size - 1))
-            line.setAngle(angle)
-            line.setVisible(True)
-            line.setPos(float(axis[row_idx]))
-
-        if len(rows) < len(cursor_lines):
-            for line in cursor_lines[len(rows):]:
-                line.setVisible(False)
-
-    def _supports_heatmap_range_selection(self) -> bool:
+    def _supports_iteration_averaging(self) -> bool:
         return self.mode_view is not None and self.mode_view.mode in {OperationMode.DTIMS, OperationMode.FTIMS}
 
-    def _heatmap_selection_axis(self) -> np.ndarray:
-        if self.mode_view is None:
+    def _selected_row_bounds(self) -> tuple[int, int]:
+        row_count = self._display_row_count()
+        if row_count <= 0:
+            return 0, 0
+        start_row = int(np.clip(self.current_row, 0, row_count - 1))
+        if not self._supports_iteration_averaging() or self.range_end_row is None:
+            return start_row, start_row
+        end_row = int(np.clip(self.range_end_row, 0, row_count - 1))
+        return (start_row, end_row) if start_row <= end_row else (end_row, start_row)
+
+    def _selected_spectrum_values(self) -> np.ndarray:
+        matrix = self._display_heatmap_matrix()
+        if matrix.ndim != 2 or matrix.shape[0] == 0:
             return np.asarray([], dtype=np.float64)
-        if self.mode_view.mode == OperationMode.DTIMS:
-            return np.arange(1, self.mode_view.heatmap.shape[0] + 1, dtype=np.float64)
-        if self.mode_view.mode == OperationMode.FTIMS:
-            return np.asarray(self.mode_view.y_axis, dtype=np.float64)
-        if self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
-            return np.asarray(self.mode_view.voltage_axis_kv, dtype=np.float64)
-        return np.asarray(self.mode_view.y_axis, dtype=np.float64)
+        row_a, row_b = self._selected_row_bounds()
+        return average_heatmap_rows(matrix, row_a, row_b)
 
-    def _selected_spectrum_data(self) -> tuple[np.ndarray, np.ndarray]:
-        if self.mode_view is None:
-            return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
-
-        x = np.asarray(self.mode_view.x_axis, dtype=np.float64)
-        if x.size == 0:
-            return x, np.asarray([], dtype=np.float64)
-
-        if self._supports_heatmap_range_selection() and self._heatmap_primary_row is not None and self._heatmap_secondary_row is not None:
-            matrix = self._display_heatmap_matrix()
-            if matrix.ndim != 2 or matrix.shape[0] == 0:
-                return x, np.asarray([], dtype=np.float64)
-            lower, upper = sorted((self._heatmap_primary_row, self._heatmap_secondary_row))
-            lower = int(np.clip(lower, 0, matrix.shape[0] - 1))
-            upper = int(np.clip(upper, 0, matrix.shape[0] - 1))
-            if lower > upper:
-                lower, upper = upper, lower
-            return x, np.mean(matrix[lower : upper + 1, :], axis=0)
-
-        return x, self._display_row(self.current_row)
-
-    def _averaged_spectrum_title(self) -> str | None:
-        if self._heatmap_primary_row is None or self._heatmap_secondary_row is None:
-            return None
-        lower, upper = sorted((self._heatmap_primary_row, self._heatmap_secondary_row))
-        count = upper - lower + 1
-        return f"Averaged Spectrum (Iterations {lower + 1}-{upper + 1}, n={count})"
-
-    def _update_selected_spectrum_display(self) -> None:
-        if self.mode_view is None or self.mode_view.heatmap.size == 0:
+    def _set_single_row_selection(self, row: int, selection_state: int) -> None:
+        display_rows = self._display_row_count()
+        if display_rows <= 0:
             return
+        self.current_row = int(np.clip(row, 0, display_rows - 1))
+        self.range_end_row = None
+        self._heat_selection_state = selection_state
 
-        x, y = self._selected_spectrum_data()
-        if x.size == 0 or y.size == 0:
+    def _set_row_range_end(self, row: int) -> None:
+        display_rows = self._display_row_count()
+        if display_rows <= 0:
             return
+        self.range_end_row = int(np.clip(row, 0, display_rows - 1))
+        self._heat_selection_state = 2
 
-        self.spectrum_curve.setData(x, y)
-        self.spectrum_plot.setLabel("bottom", self.mode_view.x_label)
-        self._apply_all_spectrum_styles()
-
-        if x.size:
-            if self.cursor_x < float(np.min(x)) or self.cursor_x > float(np.max(x)):
-                self.cursor_x = float(x[len(x) // 2])
-            self.cursor_line.setPos(self.cursor_x)
-
-        self._update_heatmap_cursor()
-        self._refresh_analysis()
+    def _reset_iteration_selection_state(self) -> None:
+        self.range_end_row = None
+        self._heat_selection_state = 0
 
     def _activate_preferred_plot_tab(self) -> None:
         if self.mode_view is not None and self.mode_view.mode == OperationMode.STEPPED_VSIMS and self._active_spectrum_target == "optimized":
@@ -874,7 +824,6 @@ class MainWindow(QMainWindow):
         self.voltage_override_missing_only_checkbox.setChecked(
             self.user_settings.voltage_override_only_when_missing
         )
-        self.invert_signal_checkbox.setChecked(self.user_settings.signal_inverted)
 
     def _apply_loaded_experiment_parameters(self) -> None:
         if self.loaded is None:
@@ -907,7 +856,6 @@ class MainWindow(QMainWindow):
             voltage_override_kv=float(self.voltage_override_spin.value()),
             voltage_override_only_when_missing=self.voltage_override_missing_only_checkbox.isChecked(),
             vs_step_table_target=self._active_spectrum_target,
-            signal_inverted=self.invert_signal_checkbox.isChecked(),
             selected_spectrum_style=self._selected_style,
             optimized_spectrum_style=self._optimized_style,
         )
@@ -956,6 +904,8 @@ class MainWindow(QMainWindow):
             return
         override_mode = self._effective_mode()
         self.mode_view = build_mode_view(self.loaded, mode_override=override_mode)
+        if not self._supports_iteration_averaging():
+            self._reset_iteration_selection_state()
         if self.mode_view is None:
             return
         mode_text = self._mode_label(self.mode_view.mode)
@@ -967,9 +917,6 @@ class MainWindow(QMainWindow):
         self._set_default_noise_window_from_mode_view()
         self._apply_all_spectrum_styles()
         self._update_plot_tab_availability()
-        self._heatmap_primary_row = None
-        self._heatmap_secondary_row = None
-        self._selected_spectrum_title_override = None
         self._render_heatmap()
         self._sync_axis_controls_to_current_data("optimized")
         self._select_row(self.current_row)
@@ -994,6 +941,7 @@ class MainWindow(QMainWindow):
         self.mode_value.setText(self.loaded.mode_label)
         self.created_value.setText(self.loaded.created_at or "-")
         self.current_row = 0
+        self._reset_iteration_selection_state()
         self._load_style_controls_from_target()
         self._apply_loaded_experiment_parameters()
         self._set_default_noise_window_from_mode_view()
@@ -1024,23 +972,24 @@ class MainWindow(QMainWindow):
         if self.mode_view is None:
             return
 
-        x, y, _, x_label, y_label = build_heatmap_display(self.mode_view)
         z = self._display_heatmap_matrix()
         if z.size == 0:
             self.heat_image.setImage(np.empty((0, 0)))
             return
 
-        if self.mode_view.mode == OperationMode.DTIMS or (
-            self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None
-        ):
-            z = z.T
-
+        display_view = ModeView(
+            mode=self.mode_view.mode,
+            x_axis=np.asarray(self.mode_view.x_axis, dtype=np.float64),
+            y_axis=np.asarray(self.mode_view.y_axis, dtype=np.float64),
+            heatmap=z,
+            x_label=self.mode_view.x_label,
+            y_label=self.mode_view.y_label,
+            voltage_axis_kv=(None if self.mode_view.voltage_axis_kv is None else np.asarray(self.mode_view.voltage_axis_kv, dtype=np.float64)),
+        )
+        x, y, display_z, x_label, y_label = build_heatmap_display(display_view)
         self.heat_plot.setLabel("bottom", x_label)
         self.heat_plot.setLabel("left", y_label)
-        if z.shape == self.mode_view.heatmap.T.shape:
-            self.heat_image.setImage(z, autoLevels=True, axisOrder="row-major")
-        else:
-            self.heat_image.setImage(z, autoLevels=True)
+        self.heat_image.setImage(display_z, autoLevels=True, axisOrder="row-major")
 
         x_min = float(np.min(x))
         x_max = float(np.max(x))
@@ -1050,10 +999,6 @@ class MainWindow(QMainWindow):
         self.heat_image.setRect(rect)
         self._update_heatmap_cursor()
         self._update_vsims_overlay_and_trace()
-        
-        # Update heatmap axis controls with current data ranges
-        self._update_axis_controls_from_data("heat", x, y)
-        self._apply_axis_ranges("heat")
 
     def _nearest_axis_index(self, axis: np.ndarray, value: float) -> int:
         if axis.size == 0:
@@ -1064,31 +1009,22 @@ class MainWindow(QMainWindow):
         if self.mode_view is None or self.mode_view.heatmap.size == 0:
             return
         pos = self.heat_plot.getViewBox().mapSceneToView(event.scenePos())
-        if self.mode_view.mode == OperationMode.DTIMS:
-            row_axis = self._heatmap_selection_axis()
-            row = self._nearest_axis_index(row_axis, float(pos.x()))
-        elif self.mode_view.mode == OperationMode.FTIMS:
-            row_axis = self._heatmap_selection_axis()
-            row = self._nearest_axis_index(row_axis, float(pos.y()))
-        elif self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
+        if self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
             row = self._nearest_axis_index(self.mode_view.voltage_axis_kv, float(pos.x()))
+        elif self.mode_view.mode in {OperationMode.DTIMS, OperationMode.FTIMS}:
+            row_count = self._display_row_count()
+            iteration_axis = np.arange(1, row_count + 1, dtype=np.float64)
+            row = self._nearest_axis_index(iteration_axis, float(pos.x()))
+            if self._heat_selection_state == 1:
+                self._set_row_range_end(row)
+                self._select_row(self.current_row, preserve_average=True)
+                return
+            next_state = 1 if self._heat_selection_state in {0, 2} else 0
+            self._set_single_row_selection(row, selection_state=next_state)
+            self._select_row(self.current_row, preserve_average=True)
+            return
         else:
             row = self._nearest_axis_index(self.mode_view.y_axis, float(pos.y()))
-
-        if self._supports_heatmap_range_selection():
-            if self._heatmap_primary_row is None or self._heatmap_secondary_row is not None:
-                self._heatmap_primary_row = row
-                self._heatmap_secondary_row = None
-                self._selected_spectrum_title_override = None
-                self._select_row(row)
-                return
-
-            self._heatmap_secondary_row = row
-            self.current_row = int(self._heatmap_primary_row)
-            self._selected_spectrum_title_override = self._averaged_spectrum_title()
-            self._update_selected_spectrum_display()
-            return
-
         self._select_row(row)
 
     def _on_spectrum_click(self, event) -> None:
@@ -1111,13 +1047,7 @@ class MainWindow(QMainWindow):
         if self.mode_view is None:
             return
         self._render_heatmap()
-        self._update_selected_spectrum_display()
-
-    def _on_signal_inversion_toggled(self, _checked: bool) -> None:
-        if self.mode_view is None:
-            return
-        self._render_heatmap()
-        self._update_selected_spectrum_display()
+        self._select_row(self.current_row)
 
     def _is_fft_mode(self) -> bool:
         if self.mode_view is None:
@@ -1152,10 +1082,6 @@ class MainWindow(QMainWindow):
         if self._is_fft_mode():
             matrix = np.abs(matrix)
 
-        # Apply signal inversion if user requested it (to correct polarity)
-        if self.invert_signal_checkbox.isChecked():
-            matrix = -matrix
-
         if not self.subtract_baseline_checkbox.isChecked():
             return matrix
 
@@ -1180,7 +1106,7 @@ class MainWindow(QMainWindow):
             return int(self.mode_view.heatmap.shape[0])
         return 0
 
-    def _select_row(self, row: int) -> None:
+    def _select_row(self, row: int, preserve_average: bool = False) -> None:
         if self.mode_view is None or self.mode_view.heatmap.size == 0:
             return
 
@@ -1189,10 +1115,26 @@ class MainWindow(QMainWindow):
             return
         row = int(np.clip(row, 0, display_rows - 1))
         self.current_row = row
-        self._heatmap_primary_row = row
-        self._heatmap_secondary_row = None
-        self._selected_spectrum_title_override = None
-        self._update_selected_spectrum_display()
+        if not preserve_average or not self._supports_iteration_averaging():
+            self.range_end_row = None
+            if self._supports_iteration_averaging() and self._heat_selection_state not in {1, 2}:
+                self._heat_selection_state = 0
+        x = self.mode_view.x_axis
+        y = self._selected_spectrum_values()
+
+        self.spectrum_curve.setData(x, y)
+        self.spectrum_plot.setLabel("bottom", self.mode_view.x_label)
+        self._apply_all_spectrum_styles()
+
+        if x.size:
+            if self.cursor_x < float(np.min(x)) or self.cursor_x > float(np.max(x)):
+                self.cursor_x = float(x[len(x) // 2])
+            self.cursor_line.setPos(self.cursor_x)
+        self._update_heatmap_cursor()
+
+        voltage_kv = self._metadata_voltage_kv_for_row(row)
+        self.metadata_voltage_value.setText("-" if voltage_kv is None else f"{voltage_kv:.4f}")
+        self._refresh_analysis()
 
     def _metadata_voltage_kv_for_row(self, row: int) -> float | None:
         if self.loaded is None or self.mode_view is None:
@@ -1222,7 +1164,8 @@ class MainWindow(QMainWindow):
             self.optimized_peak_table.setRowCount(0)
             return
 
-        x, y = self._selected_spectrum_data()
+        x = self.mode_view.x_axis
+        y = self._selected_spectrum_values()
         metadata_voltage_kv = self._metadata_voltage_kv_for_row(self.current_row)
         analysis_voltage_kv = self._effective_voltage_kv(metadata_voltage_kv)
         self.metadata_voltage_value.setText("-" if analysis_voltage_kv is None else f"{analysis_voltage_kv:.4f}")
@@ -1233,6 +1176,8 @@ class MainWindow(QMainWindow):
         gate_mult = float(self.gate_mult_spin.value())
         noise_start = float(self.noise_start_spin.value())
         noise_end = float(self.noise_end_spin.value())
+
+        self._update_noise_markers(x, y, noise_start, noise_end)
 
         if self.peak_mode_combo.currentText() == "All peaks":
             peaks = detect_all_peaks(
@@ -1473,7 +1418,7 @@ class MainWindow(QMainWindow):
             path = path.with_suffix(".csv")
 
         if target == "optimized" and self.mode_view.mode == OperationMode.STEPPED_VSIMS and self.mode_view.voltage_axis_kv is not None:
-            _, topt_values, optimized_trace = extract_optimized_trace(
+            voltage_axis, topt_values, optimized_trace = extract_optimized_trace(
                 heatmap=self._display_heatmap_matrix(),
                 x_time_ms=self.mode_view.x_axis,
                 y_voltage_kv=self.mode_view.voltage_axis_kv,
@@ -1485,10 +1430,8 @@ class MainWindow(QMainWindow):
             x = np.asarray(topt_values, dtype=np.float64)
             y = np.asarray(optimized_trace, dtype=np.float64)
         else:
-            x, y = self._selected_spectrum_data()
-            x = np.asarray(x, dtype=np.float64)
-            y = np.asarray(y, dtype=np.float64)
-
+            x = np.asarray(self.mode_view.x_axis, dtype=np.float64)
+            y = np.asarray(self._selected_spectrum_values(), dtype=np.float64)
         data = np.column_stack((x, y))
         x_label = ("Optimized Drift Time (ms)" if target == "optimized" else self.mode_view.x_label).replace(",", " ")
         np.savetxt(path, data, delimiter=",", header=f"{x_label},Signal", comments="")
